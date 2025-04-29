@@ -40,15 +40,23 @@ export interface GraphLog {
   bookmarkCount: number;
 }
 
+// Add a new interface for search history
+export interface SearchHistoryItem {
+  id: string;
+  query: string;
+  timestamp: number;
+}
+
 // Database initialization
 let dbPromise: Promise<IDBDatabase> | null = null;
 
 const DB_NAME = "llm-explorer";
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 const GRAPH_STORE = "knowledge-graphs";
 const ARTICLE_STORE = "articles";
 const BOOKMARK_STORE = "bookmarks";
 const GRAPH_LOG_STORE = "graph-logs";
+const SEARCH_HISTORY_STORE = "search-history";
 
 export function initDB(): Promise<IDBDatabase> {
   if (!dbPromise) {
@@ -123,10 +131,16 @@ export function initDB(): Promise<IDBDatabase> {
           }
         }
 
-        // Add the new graph logs store
+        // Add the graph logs store
         if (!db.objectStoreNames.contains(GRAPH_LOG_STORE)) {
           console.log(`Creating ${GRAPH_LOG_STORE} object store`);
           db.createObjectStore(GRAPH_LOG_STORE, { keyPath: "id" });
+        }
+
+        // Add the search history store
+        if (!db.objectStoreNames.contains(SEARCH_HISTORY_STORE)) {
+          console.log(`Creating ${SEARCH_HISTORY_STORE} object store`);
+          db.createObjectStore(SEARCH_HISTORY_STORE, { keyPath: "id" });
         }
       };
     });
@@ -845,5 +859,157 @@ export async function getAllGraphLogs(): Promise<GraphLog[]> {
   } catch (error) {
     console.error("Failed to get graph logs:", error);
     return [];
+  }
+}
+
+// Function to add a query to search history
+export async function addToSearchHistory(query: string): Promise<void> {
+  if (!query.trim()) return;
+
+  try {
+    const db = await initDB();
+
+    // Ensure the store exists
+    if (!db.objectStoreNames.contains(SEARCH_HISTORY_STORE)) {
+      console.log("Search history store not found, skipping");
+      return;
+    }
+
+    const tx = db.transaction(SEARCH_HISTORY_STORE, "readwrite");
+    const store = tx.objectStore(SEARCH_HISTORY_STORE);
+
+    // Check if this exact query already exists
+    const existingQueries = await getAllSearchHistory();
+    const exists = existingQueries.some(
+      (item) => item.query.toLowerCase() === query.toLowerCase(),
+    );
+
+    if (!exists) {
+      const historyItem: SearchHistoryItem = {
+        id: `query-${Date.now()}`,
+        query: query,
+        timestamp: Date.now(),
+      };
+
+      await new Promise<void>((resolve, reject) => {
+        const request = store.add(historyItem);
+        request.onsuccess = () => {
+          console.log(`Added "${query}" to search history`);
+          resolve();
+        };
+        request.onerror = (event) => {
+          console.error("Error adding to search history:", event);
+          reject(event);
+        };
+      });
+
+      // Limit history to 20 items by removing oldest if needed
+      if (existingQueries.length >= 20) {
+        // Sort by timestamp (oldest first)
+        const sortedQueries = existingQueries.sort(
+          (a, b) => a.timestamp - b.timestamp,
+        );
+
+        // Remove oldest items
+        const itemsToRemove = sortedQueries.slice(
+          0,
+          existingQueries.length - 19,
+        );
+
+        for (const item of itemsToRemove) {
+          await removeFromSearchHistory(item.id);
+        }
+      }
+    }
+  } catch (error) {
+    console.error("Failed to add to search history:", error);
+  }
+}
+
+// Function to remove a query from search history
+export async function removeFromSearchHistory(id: string): Promise<void> {
+  try {
+    const db = await initDB();
+
+    if (!db.objectStoreNames.contains(SEARCH_HISTORY_STORE)) {
+      console.log("Search history store not found, skipping");
+      return;
+    }
+
+    const tx = db.transaction(SEARCH_HISTORY_STORE, "readwrite");
+    const store = tx.objectStore(SEARCH_HISTORY_STORE);
+
+    await new Promise<void>((resolve, reject) => {
+      const request = store.delete(id);
+      request.onsuccess = () => {
+        console.log(`Removed item ${id} from search history`);
+        resolve();
+      };
+      request.onerror = (event) => {
+        console.error("Error removing from search history:", event);
+        reject(event);
+      };
+    });
+  } catch (error) {
+    console.error("Failed to remove from search history:", error);
+  }
+}
+
+// Function to get all search history items
+export async function getAllSearchHistory(): Promise<SearchHistoryItem[]> {
+  try {
+    const db = await initDB();
+
+    if (!db.objectStoreNames.contains(SEARCH_HISTORY_STORE)) {
+      console.log("Search history store not found, returning empty array");
+      return [];
+    }
+
+    const tx = db.transaction(SEARCH_HISTORY_STORE, "readonly");
+    const store = tx.objectStore(SEARCH_HISTORY_STORE);
+
+    const items = await new Promise<SearchHistoryItem[]>((resolve, reject) => {
+      const request = store.getAll();
+      request.onsuccess = () => resolve(request.result || []);
+      request.onerror = (event) => {
+        console.error("Error getting search history:", event);
+        reject(event);
+      };
+    });
+
+    // Sort by timestamp, most recent first
+    return items.sort((a, b) => b.timestamp - a.timestamp);
+  } catch (error) {
+    console.error("Failed to get search history:", error);
+    return [];
+  }
+}
+
+// Function to clear all search history
+export async function clearSearchHistory(): Promise<void> {
+  try {
+    const db = await initDB();
+
+    if (!db.objectStoreNames.contains(SEARCH_HISTORY_STORE)) {
+      console.log("Search history store not found, skipping");
+      return;
+    }
+
+    const tx = db.transaction(SEARCH_HISTORY_STORE, "readwrite");
+    const store = tx.objectStore(SEARCH_HISTORY_STORE);
+
+    await new Promise<void>((resolve, reject) => {
+      const request = store.clear();
+      request.onsuccess = () => {
+        console.log("Search history cleared");
+        resolve();
+      };
+      request.onerror = (event) => {
+        console.error("Error clearing search history:", event);
+        reject(event);
+      };
+    });
+  } catch (error) {
+    console.error("Failed to clear search history:", error);
   }
 }

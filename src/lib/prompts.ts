@@ -13,5 +13,8 @@ For example:
 
 The number should represent the relevance or closeness to ${concept}, where 100 is most relevant and 0 is barely related. Provide 15-25 concepts that cover a range of relevance, from closely related (80-100) to more distantly related (30-60).
 
-Be specific, varied, and comprehensive, covering different aspects and applications of ${concept}. Include both broader/parent concepts and narrower/specialized ones.`;
+Be specific, varied, and comprehensive, covering different aspects and applications of ${concept}. Include both broader/parent concepts and narrower/specialized ones.
+
+Always return a list of concepts, even if there are only 1 or 2. If the prompt is long, return examples of what is being asked. Get creative to come up with at least 10-20 possible connections, even if direct connections are not obvious.
+`;
 }

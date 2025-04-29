@@ -445,6 +445,81 @@ const ModelSelector: React.FC<ModelSelectorProps> = ({ onModelSelected }) => {
               Ollama runs locally and doesn't require an API key.
             </p>
           </div>
+
+          {/* Add Ollama setup instructions */}
+          <div className="mt-8 rounded-lg border border-amber-800/40 bg-amber-900/10 p-5">
+            <h3 className="mb-3 text-lg font-medium text-amber-300">
+              Setting up Ollama for Local LLM Exploration
+            </h3>
+            <div className="space-y-4 text-sm text-slate-300">
+              <p>
+                To use LLM Explorer with Ollama for completely local, private
+                AI:
+              </p>
+
+              <div>
+                <h4 className="mb-1 font-medium text-amber-200">
+                  Step 1: Install Ollama
+                </h4>
+                <p>
+                  Visit{" "}
+                  <a
+                    href="https://ollama.com"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-blue-400 hover:underline"
+                  >
+                    ollama.com
+                  </a>{" "}
+                  to download and install Ollama for your operating system.
+                </p>
+              </div>
+
+              <div>
+                <h4 className="mb-1 font-medium text-amber-200">
+                  Step 2: Clone LLM Explorer Repository
+                </h4>
+                <div className="mt-2 rounded bg-slate-800 p-3 font-mono text-xs">
+                  <code>
+                    git clone https://github.com/NateFerrero/llm-explorer.git
+                  </code>
+                  <br />
+                  <code>cd llm-explorer</code>
+                  <br />
+                  <code>npm install</code>
+                  <br />
+                  <code>npm run dev</code>
+                </div>
+              </div>
+
+              <div>
+                <h4 className="mb-1 font-medium text-amber-200">
+                  Step 3: Pull Models in Ollama
+                </h4>
+                <p>Run Ollama and pull models such as:</p>
+                <div className="mt-2 rounded bg-slate-800 p-3 font-mono text-xs">
+                  <code>ollama pull llama3</code>
+                  <br />
+                  <code>ollama pull mistral</code>
+                  <br />
+                  <code>ollama pull qwen2:0.5b</code>
+                </div>
+              </div>
+
+              <p>
+                For more details, visit our GitHub repository at{" "}
+                <a
+                  href="https://github.com/NateFerrero/llm-explorer"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-blue-400 hover:underline"
+                >
+                  github.com/NateFerrero/llm-explorer
+                </a>
+                .
+              </p>
+            </div>
+          </div>
         </div>
       </div>
     );

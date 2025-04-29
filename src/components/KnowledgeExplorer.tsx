@@ -3,12 +3,17 @@
 import { generateNodeContent } from "@/lib/api-clients";
 import { generateKnowledgeGraph } from "@/lib/graphGenerator";
 import {
+  addToSearchHistory as addToSearchHistoryDB,
+  cacheArticle,
   cacheKnowledgeGraph,
   getAllBookmarks,
   getAllGraphLogs,
+  getAllSearchHistory,
   getCachedKnowledgeGraph,
   GraphLog,
   logGraphAccess,
+  removeFromSearchHistory as removeFromSearchHistoryDB,
+  SearchHistoryItem,
   updateGraphBookmarkCount,
 } from "@/lib/indexeddb";
 import { useApiStore } from "@/lib/stores/apiStore";
@@ -23,6 +28,7 @@ import {
   History,
   Link,
   Lock,
+  LogOut,
   Maximize,
   MousePointer,
   RefreshCw,
@@ -80,10 +86,10 @@ const KnowledgeExplorer: React.FC = () => {
       console.log("A-Frame is loaded and ready to use in KnowledgeExplorer");
     }
   }, [isAFrameLoaded, aframeInstance]);
-  const { selectedModel, providerType } = useApiStore();
+  const { selectedModel, providerType, setHasSelectedModel } = useApiStore();
 
   const [searchQuery, setSearchQuery] = useState<string>("");
-  const [searchHistory, setSearchHistory] = useState<string[]>([]);
+  const [searchHistory, setSearchHistory] = useState<SearchHistoryItem[]>([]);
   const [showSearchHistory, setShowSearchHistory] = useState<boolean>(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const [isLoading, setIsLoading] = useState<boolean>(false);
@@ -201,40 +207,44 @@ const KnowledgeExplorer: React.FC = () => {
     // Don't initialize with a default topic - let user search first
   }, []);
 
-  // Load search history from localStorage on component mount
-  useEffect(() => {
-    const savedHistory = localStorage.getItem("searchHistory");
-    if (savedHistory) {
-      try {
-        setSearchHistory(JSON.parse(savedHistory));
-      } catch (e) {
-        console.error("Failed to parse search history from localStorage", e);
-        setSearchHistory([]);
-      }
+  // Load search history from IndexedDB
+  const loadSearchHistory = useCallback(async () => {
+    try {
+      const history = await getAllSearchHistory();
+      setSearchHistory(history);
+    } catch (error) {
+      console.error("Error loading search history:", error);
     }
   }, []);
 
-  // Save search history to localStorage when updated
-  useEffect(() => {
-    localStorage.setItem("searchHistory", JSON.stringify(searchHistory));
-  }, [searchHistory]);
-
-  // Add search query to history if it's unique
-  const addToSearchHistory = (query: string) => {
+  // Add to search history using IndexedDB
+  const addToSearchHistory = async (query: string) => {
     if (!query.trim()) return;
 
-    setSearchHistory((prev) => {
-      // Don't add duplicates
-      if (prev.includes(query)) return prev;
-      // Add to beginning of array, limit to 10 items
-      return [query, ...prev].slice(0, 10);
-    });
+    try {
+      await addToSearchHistoryDB(query);
+      // Reload search history to get updated list with IDs
+      await loadSearchHistory();
+    } catch (error) {
+      console.error("Error adding to search history:", error);
+    }
   };
 
-  // Remove item from search history
-  const removeFromHistory = (query: string, e: React.MouseEvent) => {
+  // Remove from search history using IndexedDB
+  const removeFromHistory = async (
+    item: SearchHistoryItem,
+    e: React.MouseEvent,
+  ) => {
     e.stopPropagation(); // Prevent triggering the parent onClick
-    setSearchHistory((prev) => prev.filter((item) => item !== query));
+    try {
+      await removeFromSearchHistoryDB(item.id);
+      // Update local state after removing from DB
+      setSearchHistory((prev) =>
+        prev.filter((historyItem) => historyItem.id !== item.id),
+      );
+    } catch (error) {
+      console.error("Error removing from search history:", error);
+    }
   };
 
   // Close search history dropdown when clicking outside
@@ -292,31 +302,45 @@ const KnowledgeExplorer: React.FC = () => {
     }
   }, [graphData.nodes.length]);
 
+  // Update handleSearch function with the skipCache parameter
   const handleSearch = async (
     query: string = searchQuery,
     skipTabChange: boolean = false,
+    skipCache: boolean = false,
   ) => {
     if (!query.trim()) return;
+
+    // Set loading state
     setIsLoading(true);
-    setError(null);
-    setSelectedNode(null);
-    setSummaryText("");
-    setDetailLevel(1);
-    setShowSearchHistory(false);
+    setError("");
 
     // Add to search history
-    addToSearchHistory(query);
+    await addToSearchHistory(query);
 
     // Update URL parameters
-    const urlParams: Record<string, string> = { q: query };
-    if (!skipTabChange) {
-      urlParams.explorerTab = "explore";
+    updateUrlParams({ q: query });
+
+    // Switch to the 'explore' tab if not already there and not skipping tab change
+    if (activeTab !== "explore" && !skipTabChange) {
+      handleTabChange("explore");
     }
-    updateUrlParams(urlParams);
 
     try {
-      const result = await generateKnowledgeGraph(query, selectedModel.id);
-      setGraphData(result);
+      let cachedGraph = skipCache ? null : await getCachedKnowledgeGraph(query);
+
+      if (cachedGraph) {
+        console.log(`Loaded cached graph for ${query}`);
+        setGraphData(cachedGraph);
+      } else {
+        // If no cached graph, generate a new one
+        console.log(`No cached graph for ${query}, generating new one`);
+        const result = await generateKnowledgeGraph(query, selectedModel.id);
+        setGraphData(result);
+
+        // Cache the newly generated graph
+        await cacheKnowledgeGraph(query, result);
+      }
+
       setSearchQuery(query);
 
       // Log graph access
@@ -328,6 +352,24 @@ const KnowledgeExplorer: React.FC = () => {
     } catch (err) {
       console.error("Error generating knowledge graph:", err);
       setError("Failed to generate knowledge graph. Please try again.");
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Hard reload function to force regeneration of the graph
+  const handleHardReload = async () => {
+    if (!searchQuery.trim()) return;
+
+    try {
+      setIsLoading(true);
+      setError("");
+
+      // Force a new graph generation by skipping cache
+      await handleSearch(searchQuery, false, true);
+    } catch (error) {
+      console.error("Error during hard reload:", error);
+      setError("Failed to reload graph. Please try again.");
     } finally {
       setIsLoading(false);
     }
@@ -656,6 +698,13 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
           console.log(`Loaded cached graph for ${bookmark.mainConcept}`);
           setGraphData(cachedGraph);
 
+          // Update URL params to reflect the new root concept
+          updateUrlParams({
+            q: bookmark.mainConcept,
+            node: bookmark.nodeId,
+            explorerTab: "explore",
+          });
+
           // Reheat the graph
           setTimeout(reheatForceSimulation, 200);
           setTimeout(reheatForceSimulation, 1000);
@@ -669,6 +718,13 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
             selectedModel.id,
           );
           setGraphData(result);
+
+          // Update URL params to reflect the new root concept
+          updateUrlParams({
+            q: bookmark.mainConcept,
+            node: bookmark.nodeId,
+            explorerTab: "explore",
+          });
 
           // Cache the newly generated graph
           await cacheKnowledgeGraph(bookmark.mainConcept, result);
@@ -685,6 +741,12 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
       } finally {
         setIsLoading(false);
       }
+    } else {
+      // Even if we're using the same graph, we should update URL params to ensure the node is reflected
+      updateUrlParams({
+        node: bookmark.nodeId,
+        explorerTab: "explore",
+      });
     }
 
     setSummaryText(bookmark.content);
@@ -715,7 +777,17 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
         // Highlight the node
         const newHighlightNodes = new Set<string>();
         newHighlightNodes.add(bookmark.nodeId);
+
+        // Add connected nodes to highlights if present
+        if (node.connections) {
+          node.connections.forEach((connId) => {
+            newHighlightNodes.add(connId);
+          });
+        }
+
         setHighlightNodes(newHighlightNodes);
+      } else {
+        console.warn(`Bookmarked node ${bookmark.nodeId} not found in graph`);
       }
     }, 1500); // Longer delay to ensure graph is rendered and reheated
   };
@@ -1243,6 +1315,25 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
     }
   }, [graphData.nodes.length]);
 
+  // Handle sign out function
+  const handleSignOut = () => {
+    // Clear selected model state
+    setHasSelectedModel(false);
+
+    // Clear API keys from localStorage
+    Object.keys(localStorage)
+      .filter((key) => key.startsWith("llm_api_key_"))
+      .forEach((key) => localStorage.removeItem(key));
+
+    // Clear other related localStorage items
+    localStorage.removeItem("llm_provider");
+    localStorage.removeItem("selected_model");
+    localStorage.removeItem("has_selected_model");
+
+    // Set the URL back to the root without parameters
+    window.location.href = window.location.pathname;
+  };
+
   return (
     <div className="flex h-full flex-col">
       {/* Keyboard shortcuts handler */}
@@ -1293,10 +1384,10 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
                     onClick={async (e) => {
                       e.preventDefault();
                       // Set the search query
-                      setSearchQuery(item);
+                      setSearchQuery(item.query);
                       // Execute the search first
                       try {
-                        await handleSearch(item);
+                        await handleSearch(item.query);
                       } catch (err) {
                         console.error("Error executing search:", err);
                       }
@@ -1304,7 +1395,7 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
                       setShowSearchHistory(false);
                     }}
                   >
-                    <span className="truncate">{item}</span>
+                    <span className="truncate">{item.query}</span>
                     <button
                       className="ml-2 rounded-full p-1 hover:bg-slate-600"
                       onClick={(e) => removeFromHistory(item, e)}
@@ -1364,6 +1455,16 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
               </div>
             )}
           </div>
+
+          {/* Sign Out Button */}
+          <button
+            onClick={handleSignOut}
+            className="flex items-center gap-1 rounded-md border border-rose-700/30 bg-rose-900/10 px-3 py-2 text-sm text-rose-300 hover:bg-rose-900/30"
+            title="Sign out and clear API keys"
+          >
+            <LogOut size={16} className="mr-1" />
+            <span className="hidden sm:inline">Sign Out</span>
+          </button>
         </div>
 
         <div className="flex flex-wrap gap-2">
