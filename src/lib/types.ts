@@ -13,6 +13,9 @@ export interface NodeObject {
     title: string;
     url: string;
   }[];
+  // Content properties
+  content?: string;
+  mainConcept?: string;
   // Force graph properties
   x?: number;
   y?: number;
@@ -70,4 +73,16 @@ export interface KnowledgeRelation {
 export interface KnowledgeGraph {
   entities: KnowledgeEntity[];
   relations: KnowledgeRelation[];
+}
+
+// Bookmark Types
+export interface BookmarkedArticle {
+  id: string;
+  nodeId: string;
+  title: string;
+  description?: string;
+  content: string;
+  mainConcept: string;
+  timestamp: number;
+  imageUrl?: string;
 }

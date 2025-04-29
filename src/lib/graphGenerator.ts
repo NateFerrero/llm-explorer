@@ -1,423 +1,166 @@
-import { GraphData, NodeObject, LinkObject, LLMProviderType } from './types';
+import { generateKnowledgeGraphPrompt, queryLLM } from "./api-clients";
+import { cacheKnowledgeGraph, getCachedKnowledgeGraph } from "./indexeddb";
+import { GraphData, LinkObject, NodeObject } from "./types";
 
-// Mock data for demonstration purposes
-// In a real application, this would make API calls to the LLM services
+// Helper function to get color based on score (0-100)
+function getColorForScore(score: number): string {
+  // Clamp score between 0 and 100
+  const clampedScore = Math.max(0, Math.min(100, score));
+
+  if (clampedScore <= 50) {
+    // Interpolate between Red (0) and Yellow (50)
+    const percentage = clampedScore / 50;
+    // Start with Red (255, 0, 0), move towards Yellow (255, 255, 0)
+    const green = Math.round(255 * percentage);
+    return `rgb(255, ${green}, 0)`;
+  } else {
+    // Interpolate between Yellow (50) and Green (100)
+    const percentage = (clampedScore - 50) / 50;
+    // Start with Yellow (255, 255, 0), move towards Green (0, 255, 0)
+    const red = Math.round(255 * (1 - percentage));
+    return `rgb(${red}, 255, 0)`;
+  }
+}
+
 export async function generateKnowledgeGraph(
   concept: string,
-  modelId: string
+  modelId: string,
+  useCache: boolean = true,
 ): Promise<GraphData> {
-  // Simulate API call delay
-  await new Promise(resolve => setTimeout(resolve, 1500));
-  
-  // Create sample nodes based on the concept
+  console.log(
+    `Generating knowledge graph for "${concept}" using model ${modelId}`,
+  );
+
+  // Try to load from cache first if useCache is true
+  if (useCache && typeof window !== "undefined") {
+    try {
+      const cachedGraph = await getCachedKnowledgeGraph(concept);
+      if (cachedGraph) {
+        console.log(`Using cached knowledge graph for "${concept}"`);
+        return cachedGraph;
+      }
+    } catch (error) {
+      console.error("Error accessing cache:", error);
+      // Continue with generating the graph
+    }
+  }
+
   const nodes: NodeObject[] = [];
   const links: LinkObject[] = [];
-  
+
   // Add the main concept node
-  nodes.push({
+  const mainConceptNode: NodeObject = {
     id: concept,
     name: concept,
-    val: 20,
-    color: "#e91e63",
+    val: 50, // Give main concept a decent default size value
+    color: "#e91e63", // Keep main concept distinct (Pink)
     description: `Main concept: ${concept}`,
-    categories: ["Main Topic"],
-  });
-  
-  // Generate related concepts based on the main concept
-  const relatedConcepts = generateRelatedConcepts(concept);
-  
-  // Add related concept nodes and links
-  relatedConcepts.forEach((relatedConcept) => {
-    // Ensure each node has a proper name that matches its ID
-    const nodeName = relatedConcept.name || relatedConcept.id;
-    
-    // Add node
-    nodes.push({
-      id: relatedConcept.id,
-      name: nodeName, // Use the proper name
-      val: 10,
-      color: getNodeColorByType(relatedConcept.type),
-      description: relatedConcept.description,
-      categories: [relatedConcept.type],
-      connections: relatedConcept.connections,
-      resources: generateSampleResources(nodeName),
-    });
-    
-    // Add link between main concept and related concept
-    links.push({
-      source: concept,
-      target: relatedConcept.id,
-      value: 1,
-    });
-    
-    // Add links between some related concepts to make graph more interesting
-    relatedConcept.connections?.forEach((connection) => {
-      if (relatedConcepts.some(c => c.id === connection)) {
-        links.push({
-          source: relatedConcept.id,
-          target: connection,
-          value: 0.5,
-          color: "#aaa"
-        });
+  };
+  nodes.push(mainConceptNode);
+
+  try {
+    // 1. Generate the prompt
+    const prompt = generateKnowledgeGraphPrompt(concept);
+
+    // 2. Query the LLM
+    const response = await queryLLM(prompt, modelId);
+
+    if (!response.success || !response.data) {
+      throw new Error(
+        response.error || "LLM query failed with no specific error message.",
+      );
+    }
+
+    // 3. Parse the LLM response
+    const lines = response.data
+      .split("\n")
+      .filter((line: string) => line.trim() !== "");
+    console.log(
+      `Received ${lines.length} lines from LLM for graph generation.`,
+    );
+
+    lines.forEach((line: string, index: number) => {
+      try {
+        const parts = line.split(",");
+        if (parts.length < 2) {
+          console.warn(`Skipping malformed line (no comma): ${line}`);
+          return; // Skip this line
+        }
+
+        const scoreStr = parts[0].trim();
+        const conceptName = parts.slice(1).join(",").trim(); // Join back in case concept name had commas
+        const score = parseInt(scoreStr, 10);
+
+        if (isNaN(score) || score < 0 || score > 100) {
+          console.warn(
+            `Skipping line with invalid score (${scoreStr}): ${line}`,
+          );
+          return; // Skip if score is invalid
+        }
+
+        if (!conceptName) {
+          console.warn(`Skipping line with empty concept name: ${line}`);
+          return; // Skip if concept name is empty
+        }
+
+        // Prevent adding duplicate nodes (case-insensitive check)
+        if (
+          nodes.some((n) => n.id.toLowerCase() === conceptName.toLowerCase())
+        ) {
+          console.warn(`Skipping duplicate concept: ${conceptName}`);
+          return;
+        }
+
+        // Create node
+        const newNode: NodeObject = {
+          id: conceptName, // Use concept name as ID
+          name: conceptName,
+          val: score, // Use score for node size value
+          color: getColorForScore(score), // Set color based on score
+          description: `Related concept to ${concept} (Score: ${score})`,
+        };
+        nodes.push(newNode);
+
+        // Create link from main concept
+        const newLink: LinkObject = {
+          source: mainConceptNode.id,
+          target: newNode.id,
+          value: score / 100, // Normalize score for link value (e.g., thickness/opacity)
+        };
+        links.push(newLink);
+      } catch (parseError) {
+        console.error(`Error parsing line ${index + 1}: "${line}"`, parseError);
+        // Continue processing other lines
       }
     });
-  });
-  
-  return { nodes, links };
-}
+  } catch (error) {
+    console.error(
+      `Failed to generate or parse knowledge graph from LLM for concept "${concept}":`,
+      error,
+    );
+    // Return a minimal graph with just the main node and an error description
+    mainConceptNode.description += `\n\nError generating related concepts: ${error instanceof Error ? error.message : "Unknown error"}`;
+    // Optionally, add a single error node?
+    // nodes.push({ id: "error-node", name: "Error", val: 10, color: "red", description: ... });
+  }
 
-// Mock function to generate related concepts
-function generateRelatedConcepts(concept: string): NodeObject[] {
-  // This would normally be generated by the LLM
-  // Here we just have some hardcoded examples for demo purposes
-  
-  if (concept.toLowerCase().includes("artificial intelligence") || concept.toLowerCase().includes("ai")) {
-    return [
-      {
-        id: "Machine Learning",
-        name: "Machine Learning",
-        description: "A subset of AI focused on building systems that learn from data",
-        categories: ["Subfield"],
-        type: "Subfield",
-        connections: ["Deep Learning", "Neural Networks", "Data Science"]
-      },
-      {
-        id: "Neural Networks",
-        name: "Neural Networks",
-        description: "Computing systems inspired by biological neural networks",
-        categories: ["Technology"],
-        type: "Technology",
-        connections: ["Deep Learning", "Machine Learning"]
-      },
-      {
-        id: "Deep Learning",
-        name: "Deep Learning",
-        description: "A class of machine learning based on artificial neural networks",
-        categories: ["Technique"],
-        type: "Technique",
-        connections: ["Neural Networks", "Computer Vision"]
-      },
-      {
-        id: "Computer Vision",
-        name: "Computer Vision",
-        description: "Field of AI that enables computers to derive information from images",
-        categories: ["Application"],
-        type: "Application",
-        connections: ["Deep Learning", "Image Processing"]
-      },
-      {
-        id: "Natural Language Processing",
-        name: "Natural Language Processing",
-        description: "Processing and analyzing natural language data",
-        categories: ["Subfield"],
-        type: "Subfield",
-        connections: ["Machine Learning", "Linguistics"]
-      },
-      {
-        id: "Reinforcement Learning",
-        name: "Reinforcement Learning",
-        description: "Learning through interaction with an environment",
-        categories: ["Technique"],
-        type: "Technique",
-        connections: ["Machine Learning", "Game AI"]
-      },
-      {
-        id: "Ethics in AI",
-        name: "Ethics in AI",
-        description: "Ethical considerations in developing and using AI",
-        categories: ["Concept"],
-        type: "Concept",
-        connections: ["AI Regulation", "AI Bias"]
-      },
-      {
-        id: "AI Bias",
-        name: "AI Bias",
-        description: "Systematic errors in AI systems that can lead to unfair outcomes",
-        categories: ["Challenge"],
-        type: "Challenge",
-        connections: ["Ethics in AI", "Machine Learning"]
-      },
-    ];
-  }
-  else if (concept.toLowerCase().includes("quantum") || concept.toLowerCase().includes("physics")) {
-    return [
-      {
-        id: "Quantum Mechanics",
-        name: "Quantum Mechanics",
-        description: "Theory describing nature at the atomic and subatomic scales",
-        categories: ["Theory"],
-        type: "Theory",
-        connections: ["Quantum Entanglement", "Wave-Particle Duality"]
-      },
-      {
-        id: "Quantum Entanglement",
-        name: "Quantum Entanglement",
-        description: "Phenomenon where particles become correlated in ways that cannot be explained by classical physics",
-        categories: ["Phenomenon"],
-        type: "Phenomenon",
-        connections: ["Quantum Mechanics", "Quantum Computing"]
-      },
-      {
-        id: "Wave-Particle Duality",
-        name: "Wave-Particle Duality",
-        description: "Concept that every particle can be described as both a particle and a wave",
-        categories: ["Concept"],
-        type: "Concept",
-        connections: ["Quantum Mechanics", "Double-Slit Experiment"]
-      },
-      {
-        id: "Quantum Computing",
-        name: "Quantum Computing",
-        description: "Computation using quantum-mechanical phenomena",
-        categories: ["Technology"],
-        type: "Technology",
-        connections: ["Quantum Entanglement", "Quantum Algorithms"]
-      },
-      {
-        id: "Quantum Field Theory",
-        name: "Quantum Field Theory",
-        description: "Theoretical framework combining quantum mechanics and special relativity",
-        categories: ["Theory"],
-        type: "Theory",
-        connections: ["Particle Physics", "Quantum Mechanics"]
-      },
-      {
-        id: "Particle Physics",
-        name: "Particle Physics",
-        description: "Branch of physics studying subatomic particles and their interactions",
-        categories: ["Field"],
-        type: "Field",
-        connections: ["Quantum Field Theory", "Standard Model"]
-      },
-      {
-        id: "Standard Model",
-        name: "Standard Model",
-        description: "Theory describing three of the four fundamental forces",
-        categories: ["Theory"],
-        type: "Theory",
-        connections: ["Particle Physics", "Higgs Boson"]
-      },
-    ];
-  }
-  else if (concept.toLowerCase().includes("biology") || concept.toLowerCase().includes("life")) {
-    return [
-      {
-        id: "Cell Biology",
-        name: "Cell Biology",
-        description: "Study of cells - the fundamental units of life",
-        categories: ["Field"],
-        type: "Field",
-        connections: ["Molecular Biology", "Genetics"]
-      },
-      {
-        id: "Genetics",
-        name: "Genetics",
-        description: "Study of genes, genetic variation, and heredity",
-        categories: ["Field"],
-        type: "Field",
-        connections: ["DNA", "Evolution"]
-      },
-      {
-        id: "DNA",
-        name: "DNA",
-        description: "Molecule carrying genetic instructions for development and functioning",
-        categories: ["Molecule"],
-        type: "Molecule",
-        connections: ["Genetics", "RNA"]
-      },
-      {
-        id: "Evolution",
-        name: "Evolution",
-        description: "Process of change in heritable characteristics of populations over successive generations",
-        categories: ["Theory"],
-        type: "Theory",
-        connections: ["Natural Selection", "Genetics"]
-      },
-      {
-        id: "Ecology",
-        name: "Ecology",
-        description: "Study of organisms and their interactions with environment",
-        categories: ["Field"],
-        type: "Field",
-        connections: ["Ecosystems", "Conservation Biology"]
-      },
-      {
-        id: "Molecular Biology",
-        name: "Molecular Biology",
-        description: "Study of biology at molecular level",
-        categories: ["Field"],
-        type: "Field",
-        connections: ["Cell Biology", "Biochemistry"]
-      },
-      {
-        id: "Biochemistry",
-        name: "Biochemistry",
-        description: "Study of chemical processes within living organisms",
-        categories: ["Field"],
-        type: "Field",
-        connections: ["Molecular Biology", "Metabolism"]
-      },
-    ];
-  }
-  else if (concept.toLowerCase().includes("computer") || concept.toLowerCase().includes("programming")) {
-    return [
-      {
-        id: "Software Engineering",
-        name: "Software Engineering",
-        description: "Application of engineering principles to software development",
-        categories: ["Field"],
-        type: "Field",
-        connections: ["Programming Languages", "Software Architecture"]
-      },
-      {
-        id: "Programming Languages",
-        name: "Programming Languages",
-        description: "Formal languages for instructing computers",
-        categories: ["Tool"],
-        type: "Tool",
-        connections: ["Software Engineering", "Compilers"]
-      },
-      {
-        id: "Algorithms",
-        name: "Algorithms",
-        description: "Step-by-step procedures for calculations or problem-solving",
-        categories: ["Concept"],
-        type: "Concept",
-        connections: ["Data Structures", "Computational Complexity"]
-      },
-      {
-        id: "Data Structures",
-        name: "Data Structures",
-        description: "Specialized formats for organizing and storing data",
-        categories: ["Concept"],
-        type: "Concept",
-        connections: ["Algorithms", "Memory Management"]
-      },
-      {
-        id: "Operating Systems",
-        name: "Operating Systems",
-        description: "Software that manages computer hardware and software resources",
-        categories: ["Software"],
-        type: "Software",
-        connections: ["Computer Architecture", "System Software"]
-      },
-      {
-        id: "Computer Networks",
-        name: "Computer Networks",
-        description: "Digital telecommunications networks for sharing resources",
-        categories: ["Infrastructure"],
-        type: "Infrastructure",
-        connections: ["Internet", "Network Protocols"]
-      },
-      {
-        id: "Databases",
-        name: "Databases",
-        description: "Organized collections of data stored electronically",
-        categories: ["Technology"],
-        type: "Technology",
-        connections: ["Data Management", "SQL"]
-      },
-    ];
-  }
-  else {
-    // Generate more meaningful related concepts based on the input concept
-    const conceptWords = concept.toLowerCase().split(/\s+/);
-    const baseTopics = [
-      {
-        id: `${concept} Fundamentals`,
-        name: `${concept} Fundamentals`,
-        description: `Core principles and basic concepts of ${concept}`,
-        categories: ["Fundamentals"],
-        type: "Fundamentals",
-        connections: [`${concept} Applications`, `${concept} History`]
-      },
-      {
-        id: `${concept} Applications`,
-        name: `${concept} Applications`,
-        description: `Practical uses and implementations of ${concept} in the real world`,
-        categories: ["Application"],
-        type: "Application",
-        connections: [`${concept} Fundamentals`, `${concept} Technologies`]
-      },
-      {
-        id: `${concept} Technologies`,
-        name: `${concept} Technologies`,
-        description: `Tools, platforms, and systems related to ${concept}`,
-        categories: ["Technology"],
-        type: "Technology",
-        connections: [`${concept} Applications`, `${concept} Future Trends`]
-      },
-      {
-        id: `${concept} History`,
-        name: `${concept} History`,
-        description: `Historical development and evolution of ${concept}`,
-        categories: ["History"],
-        type: "History",
-        connections: [`${concept} Fundamentals`, `${concept} Key Figures`]
-      },
-      {
-        id: `${concept} Key Figures`,
-        name: `${concept} Key Figures`,
-        description: `Important people who contributed to the field of ${concept}`,
-        categories: ["People"],
-        type: "People",
-        connections: [`${concept} History`, `${concept} Research`]
-      },
-      {
-        id: `${concept} Research`,
-        name: `${concept} Research`,
-        description: `Current research areas and academic studies in ${concept}`,
-        categories: ["Research"],
-        type: "Research",
-        connections: [`${concept} Key Figures`, `${concept} Future Trends`]
-      },
-      {
-        id: `${concept} Future Trends`,
-        name: `${concept} Future Trends`,
-        description: `Emerging directions and future developments in ${concept}`,
-        categories: ["Future"],
-        type: "Future",
-        connections: [`${concept} Research`, `${concept} Technologies`]
-      },
-    ];
-    
-    return baseTopics;
-  }
-}
+  const graphData: GraphData = { nodes, links };
 
-// Generate sample resources for a concept
-function generateSampleResources(concept: string) {
-  return [
-    {
-      title: `Introduction to ${concept}`,
-      url: `https://example.com/${concept.toLowerCase().replace(/\s+/g, '-')}`,
-    },
-    {
-      title: `${concept} in Practice`,
-      url: `https://example.com/${concept.toLowerCase().replace(/\s+/g, '-')}/practice`,
+  // Cache the generated graph
+  if (typeof window !== "undefined") {
+    try {
+      await cacheKnowledgeGraph(concept, graphData);
+    } catch (error) {
+      console.error("Error caching knowledge graph:", error);
     }
-  ];
+  }
+
+  console.log(
+    `Generated graph with ${nodes.length} nodes and ${links.length} links.`,
+  );
+  return graphData;
 }
 
-// Get color for node based on its type
-function getNodeColorByType(type: string): string {
-  const colorMap: {[key: string]: string} = {
-    "Subfield": "#2196f3", // Blue
-    "Technology": "#4caf50", // Green
-    "Technique": "#ff9800", // Orange
-    "Application": "#9c27b0", // Purple
-    "Concept": "#00bcd4", // Cyan
-    "Challenge": "#f44336", // Red
-    "Theory": "#3f51b5", // Indigo
-    "Phenomenon": "#009688", // Teal
-    "Field": "#ffc107", // Amber
-    "Related": "#607d8b", // Blue Grey
-    "Example": "#8bc34a", // Light Green
-    "Principle": "#e91e63", // Pink
-    "History": "#795548", // Brown
-    "Implementation": "#673ab7", // Deep Purple
-    "Future": "#ff5722", // Deep Orange
-  };
-  
-  return colorMap[type] || "#607d8b"; // Default to blue grey
-}
+// Removed generateRelatedConcepts function
+// Removed getNodeColorByType function
+// Removed generateSampleResources function

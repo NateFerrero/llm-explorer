@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useState, createContext, useContext } from "react";
+import React, { createContext, useContext, useEffect, useState } from "react";
 interface AFrameWrapperProps {
   children?: React.ReactNode;
 }
@@ -11,58 +11,49 @@ export const AFrameContext = createContext<{
   aframeInstance: any;
 }>({
   isAFrameLoaded: false,
-  aframeInstance: null
+  aframeInstance: null,
 });
-const AFrameWrapper: React.FC<AFrameWrapperProps> = ({
-  children
-}) => {
-  const [isAFrameLoaded, setIsAFrameLoaded] = useState<boolean>(false);
-  const [aframeInstance, setAframeInstance] = useState<any>(null);
+const AFrameWrapper: React.FC<AFrameWrapperProps> = ({ children }) => {
+  // State will now be updated by the global script loading in layout.tsx
+  const [isAFrameLoaded, setIsAFrameLoaded] = useState<boolean>(
+    typeof window !== "undefined" && !!window.AFRAME,
+  );
+  const [aframeInstance, setAframeInstance] = useState<any>(
+    typeof window !== "undefined" ? window.AFRAME : null,
+  );
+
+  // Effect to listen for A-Frame being loaded (if not already)
   useEffect(() => {
-    // Prevent multiple loading attempts
     if (isAFrameLoaded) return;
 
-    // Define a global variable to store the AFRAME object
-    if (typeof window !== 'undefined') {
-      // Create a script element to load A-Frame
-      const script = document.createElement('script');
-      script.src = 'https://aframe.io/releases/1.4.0/aframe.min.js';
-      script.async = true;
-      script.onload = () => {
-        // When script is loaded, AFRAME global will be available
-        if (typeof window.AFRAME !== 'undefined') {
-          setAframeInstance(window.AFRAME);
-          setIsAFrameLoaded(true);
-          console.log("A-Frame loaded successfully via script tag");
-        }
-      };
-      script.onerror = err => {
-        console.error("Failed to load A-Frame via script tag:", err);
+    const checkAFrame = () => {
+      if (typeof window !== "undefined" && window.AFRAME) {
+        console.log("A-Frame detected by AFrameWrapper");
+        setAframeInstance(window.AFRAME);
+        setIsAFrameLoaded(true);
+        // Clear the interval once A-Frame is loaded
+        clearInterval(intervalId);
+      }
+    };
 
-        // Fallback to dynamic import if script tag fails
-        import("aframe").then(aframe => {
-          setAframeInstance(aframe);
-          setIsAFrameLoaded(true);
-          console.log("A-Frame loaded successfully via dynamic import");
-        }).catch(importErr => {
-          console.error("Failed to load A-Frame via dynamic import:", importErr);
-        });
-      };
-      document.head.appendChild(script);
-      return () => {
-        // Cleanup script tag if component unmounts during loading
-        if (script.parentNode) {
-          script.parentNode.removeChild(script);
-        }
-      };
-    }
-  }, [isAFrameLoaded]);
-  return <AFrameContext.Provider value={{
-    isAFrameLoaded,
-    aframeInstance
-  }}>
+    // Check immediately and set up an interval for backup
+    checkAFrame();
+    const intervalId = setInterval(checkAFrame, 100); // Check every 100ms
+
+    // Cleanup interval on component unmount
+    return () => clearInterval(intervalId);
+  }, [isAFrameLoaded]); // Re-run if isAFrameLoaded changes (though it shouldn't after first load)
+
+  return (
+    <AFrameContext.Provider
+      value={{
+        isAFrameLoaded,
+        aframeInstance,
+      }}
+    >
       {children}
-    </AFrameContext.Provider>;
+    </AFrameContext.Provider>
+  );
 };
 
 // Custom hook to access A-Frame context
