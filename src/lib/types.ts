@@ -23,6 +23,7 @@ export interface NodeObject {
   vy?: number;
   fx?: number;
   fy?: number;
+  isMainEntry?: boolean;
 }
 
 export interface LinkObject {

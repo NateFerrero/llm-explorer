@@ -23,6 +23,7 @@ import {
   Bookmark,
   ChevronDown,
   Focus,
+  GrapeIcon,
   Hand,
   HelpCircle,
   History,
@@ -89,6 +90,7 @@ const KnowledgeExplorer: React.FC = () => {
   const { selectedModel, providerType, setHasSelectedModel } = useApiStore();
 
   const [searchQuery, setSearchQuery] = useState<string>("");
+  const [inputValue, setInputValue] = useState<string>(""); // New state for input field
   const [searchHistory, setSearchHistory] = useState<SearchHistoryItem[]>([]);
   const [showSearchHistory, setShowSearchHistory] = useState<boolean>(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
@@ -113,6 +115,7 @@ const KnowledgeExplorer: React.FC = () => {
   const [showHelp, setShowHelp] = useState<boolean>(false);
   const [showKeyboardShortcuts, setShowKeyboardShortcuts] =
     useState<boolean>(false);
+  const [expansionLevel, setExpansionLevel] = useState<number>(0);
   const graphRef = useRef<any>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [modelSwitcherOpen, setModelSwitcherOpen] = useState(false);
@@ -138,6 +141,8 @@ const KnowledgeExplorer: React.FC = () => {
   const [bookmarksLoading, setBookmarksLoading] = useState(false);
   const [graphLogs, setGraphLogs] = useState<GraphLog[]>([]);
   const [graphLogsLoading, setGraphLogsLoading] = useState(false);
+  // Add a ref to track processed URL states
+  const processedUrlStatesRef = useRef<Set<string>>(new Set());
 
   // Mouse event handlers for resizing
   const handleMouseDown = (e: React.MouseEvent) => {
@@ -217,6 +222,11 @@ const KnowledgeExplorer: React.FC = () => {
     }
   }, []);
 
+  // Load search history when component mounts
+  useEffect(() => {
+    loadSearchHistory();
+  }, [loadSearchHistory]);
+
   // Add to search history using IndexedDB
   const addToSearchHistory = async (query: string) => {
     if (!query.trim()) return;
@@ -264,9 +274,113 @@ const KnowledgeExplorer: React.FC = () => {
 
   const handleExploreNode = async (node: NodeObject) => {
     const nodeName = node.name || node.id;
+    console.log(`Exploring node ${nodeName} as main concept`);
+
+    // Set the search query to the node name or ID
     setSearchQuery(nodeName);
-    handleTabChange("explore"); // Use handleTabChange to update URL as well
-    await handleSearch(nodeName);
+    setInputValue(nodeName);
+
+    // Clear the selected node and content
+    setSelectedNode(null);
+    setSummaryText("");
+    setSummaryLoading(false);
+
+    // Switch to the explore tab
+    handleTabChange("explore");
+
+    // Mark this URL state as processed to prevent infinite loops
+    const urlStateKey = `${nodeName}-null-explore`;
+    processedUrlStatesRef.current.add(urlStateKey);
+
+    // Update URL to reflect we're viewing this node as a main concept
+    // Explicitly clear the node parameter
+    updateUrlParams({
+      q: nodeName,
+      node: undefined, // Clear the node parameter as we're viewing it as a main concept
+    });
+
+    // Set loading state
+    setIsLoading(true);
+
+    try {
+      // First check if we have a cached graph for this node
+      let cachedGraph = await getCachedKnowledgeGraph(nodeName);
+
+      if (cachedGraph) {
+        console.log(`Loaded cached graph for ${nodeName}`);
+        setGraphData(cachedGraph);
+      } else {
+        console.log(`Generating new knowledge graph for ${nodeName}`);
+        // Generate a new knowledge graph for this node
+        const result = await generateKnowledgeGraph(nodeName, selectedModel.id);
+        setGraphData(result);
+
+        // Cache the newly generated graph
+        await cacheKnowledgeGraph(nodeName, result);
+      }
+
+      // Log this access to the graph
+      await logGraphAccess(nodeName);
+
+      // Find the main node in the graph data (should be the first node)
+      const mainNode =
+        cachedGraph?.nodes.find((n) => n.id === nodeName) ||
+        graphData.nodes.find((n) => n.id === nodeName);
+
+      if (mainNode) {
+        // Create a copy with the isMainEntry flag
+        const mainEntryNode = {
+          ...mainNode,
+          isMainEntry: true,
+          mainConcept: nodeName,
+        };
+
+        // Set as selected node
+        setSelectedNode(mainEntryNode);
+        setSummaryLoading(true);
+
+        // Generate content for this node as a main concept
+        try {
+          const content = await generateNodeContent(
+            mainEntryNode,
+            nodeName, // The context is now this node itself
+            selectedModel.id,
+            1, // Start with detail level 1
+          );
+
+          // Update content
+          updateNodeWithContent(mainEntryNode, content);
+
+          // Cache this content
+          await cacheArticle({
+            id: `article-${nodeName}-1-${selectedModel.id}-${nodeName}`,
+            nodeId: nodeName,
+            concept: nodeName,
+            title: mainNode.name || mainNode.id,
+            content: content,
+            detailLevel: 1,
+            timestamp: Date.now(),
+            mainConcept: nodeName,
+          });
+        } catch (error) {
+          console.error("Error generating content for main entry:", error);
+          updateNodeWithContent(
+            mainEntryNode,
+            generateFallbackContent(mainEntryNode, nodeName),
+          );
+        }
+      } else {
+        console.error(`Could not find main node for ${nodeName} in graph data`);
+      }
+
+      // Apply a single reheat after loading
+      setTimeout(reheatForceSimulation, 300);
+    } catch (error) {
+      console.error(`Error exploring node ${nodeName} as main concept:`, error);
+      setError(`Failed to explore ${nodeName}: ${error}`);
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   // Function to manually reheat the force simulation
@@ -274,37 +388,69 @@ const KnowledgeExplorer: React.FC = () => {
     if (ForceGraph.current && graphData.nodes.length > 0) {
       console.log("Manual force reheat triggered");
 
-      // Reheat the simulation with moderate energy
-      const simulation = ForceGraph.current.d3Force();
-      if (simulation) {
-        // Use 0.7 instead of 1 for a more natural expansion
-        simulation.alpha(0.7).restart();
-
-        // Don't run manual ticks to let the simulation evolve naturally
-      }
-
-      // Apply a gentler force multiplier
+      // Apply moderate repulsion force
       const chargeForce = ForceGraph.current.d3Force("charge");
       if (chargeForce) {
-        const originalStrength = chargeForce.strength();
-        // Use 1.5 instead of 2 for more natural expansion
-        chargeForce.strength(originalStrength * 1.5);
+        chargeForce.strength(-200);
+      }
 
-        // Reset after a delay
-        setTimeout(() => {
-          if (chargeForce && ForceGraph.current) {
-            // Gradually return to normal strength
-            chargeForce.strength(originalStrength);
-            ForceGraph.current.d3Force().alpha(0.2).restart();
-          }
-        }, 600);
+      // Set moderate link distance
+      const linkForce = ForceGraph.current.d3Force("link");
+      if (linkForce) {
+        linkForce.distance(150);
+      }
+
+      // Reheat the simulation with moderate energy
+      const simulation = ForceGraph.current.d3Force();
+      if (simulation && typeof simulation.alpha === "function") {
+        // Use moderate alpha value
+        simulation.alpha(0.5).restart();
+      }
+    }
+  }, [graphData.nodes.length]);
+
+  // Simplified function to expand graph to fill space
+  const expandGraphToFillSpace = useCallback(() => {
+    if (ForceGraph.current && graphData.nodes.length > 0) {
+      // Get container dimensions
+      const width = containerRef.current?.clientWidth || 800;
+      const height = containerRef.current?.clientHeight || 600;
+
+      console.log(`Expanding graph to fill space: ${width}x${height}`);
+
+      // Apply a consistent, moderate force
+      const chargeForce = ForceGraph.current.d3Force("charge");
+      if (chargeForce) {
+        // Moderate repulsion - increase slightly based on node count
+        const baseForce = -200;
+        const nodeCount = graphData.nodes.length;
+        const adjustedForce = nodeCount > 30 ? baseForce * 1.5 : baseForce;
+
+        console.log(`Setting charge force to ${adjustedForce}`);
+        chargeForce.strength(adjustedForce);
+      }
+
+      // Adjust link distance modestly
+      const linkForce = ForceGraph.current.d3Force("link");
+      if (linkForce) {
+        const nodeCount = graphData.nodes.length;
+        // Scale link distance based on node count, but keep it reasonable
+        const distance = Math.min(180, 120 + nodeCount);
+        linkForce.distance(distance);
+        console.log(`Setting link distance to ${distance}`);
+      }
+
+      // Apply moderate energy
+      const simulation = ForceGraph.current.d3Force();
+      if (simulation && typeof simulation.alpha === "function") {
+        simulation.alpha(0.5).restart();
       }
     }
   }, [graphData.nodes.length]);
 
   // Update handleSearch function with the skipCache parameter
   const handleSearch = async (
-    query: string = searchQuery,
+    query: string = inputValue,
     skipTabChange: boolean = false,
     skipCache: boolean = false,
   ) => {
@@ -314,11 +460,25 @@ const KnowledgeExplorer: React.FC = () => {
     setIsLoading(true);
     setError("");
 
+    // Clear the selected node and content when changing to a new concept
+    if (query !== searchQuery) {
+      setSelectedNode(null);
+      setSummaryText("");
+      setSummaryLoading(false);
+    }
+
     // Add to search history
     await addToSearchHistory(query);
 
-    // Update URL parameters
-    updateUrlParams({ q: query });
+    // Create a URL state key and mark it as processed to prevent infinite loops
+    const urlStateKey = `${query}-null-${activeTab}`;
+    processedUrlStatesRef.current.add(urlStateKey);
+
+    // Update URL parameters - explicitly clear node parameter when changing concepts
+    updateUrlParams({
+      q: query,
+      node: undefined, // Clear the node parameter when searching for a new concept
+    });
 
     // Switch to the 'explore' tab if not already there and not skipping tab change
     if (activeTab !== "explore" && !skipTabChange) {
@@ -346,9 +506,8 @@ const KnowledgeExplorer: React.FC = () => {
       // Log graph access
       await logGraphAccess(query);
 
-      // Schedule a manual reheat after the graph is loaded
-      setTimeout(reheatForceSimulation, 200);
-      setTimeout(reheatForceSimulation, 1000);
+      // Just use a single reheat with a slight delay
+      setTimeout(reheatForceSimulation, 300);
     } catch (err) {
       console.error("Error generating knowledge graph:", err);
       setError("Failed to generate knowledge graph. Please try again.");
@@ -395,6 +554,7 @@ const KnowledgeExplorer: React.FC = () => {
     console.log("Setting content for node:", nodeObj.name || nodeObj.id);
     console.log("Content length:", cleanedContent.length);
     console.log("Content preview:", cleanedContent.substring(0, 100));
+    console.log("Context:", nodeObj.mainConcept || "None");
 
     // Set summary text state
     setSummaryText(cleanedContent);
@@ -403,7 +563,6 @@ const KnowledgeExplorer: React.FC = () => {
     const updatedNode = {
       ...nodeObj,
       content: cleanedContent,
-      mainConcept: searchQuery,
     };
 
     console.log("Updated node has content property:", "content" in updatedNode);
@@ -478,29 +637,56 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
   };
 
   const handleZoom = (direction: "in" | "out") => {
-    if (graphRef.current) {
-      const currentZoom = graphRef.current.zoom();
-      // Make zoom factor much more subtle (1.03-1.05 instead of 1.5)
-      const zoomFactor = direction === "in" ? 1.05 : 0.95;
-      const newZoom = currentZoom * zoomFactor;
-      graphRef.current.zoom(newZoom, 400);
-      setZoomLevel(newZoom);
+    if (ForceGraph.current) {
+      console.log("Zoom triggered:", direction);
+      try {
+        const currentZoom = ForceGraph.current.zoom();
+        console.log("Current zoom level:", currentZoom);
+
+        // Make zoom factor much more subtle (1.03 instead of 1.05)
+        const zoomFactor = direction === "in" ? 1.03 : 0.97;
+        const newZoom = currentZoom * zoomFactor;
+
+        console.log("Setting new zoom level:", newZoom);
+        ForceGraph.current.zoom(newZoom, 400); // This is the right reference
+        setZoomLevel(newZoom);
+      } catch (error) {
+        console.error("Error during zoom operation:", error);
+      }
+    } else {
+      console.warn("Graph reference not available for zoom operation");
     }
   };
 
   const resetZoom = () => {
-    if (graphRef.current) {
-      graphRef.current.zoomToFit(400, 30); // 400ms transition, 30px padding
-      setZoomLevel(1);
+    if (ForceGraph.current) {
+      console.log("Reset zoom triggered");
+      try {
+        ForceGraph.current.zoomToFit(400, 30); // 400ms transition, 30px padding
+        setZoomLevel(1);
+      } catch (error) {
+        console.error("Error during zoom reset:", error);
+      }
+    } else {
+      console.warn("Graph reference not available for zoom reset");
     }
   };
+
   const centerGraph = () => {
-    if (graphRef.current) {
-      graphRef.current.centerAt(0, 0, 800);
-      graphRef.current.zoom(1, 800);
-      setZoomLevel(1);
+    if (ForceGraph.current) {
+      console.log("Center graph triggered");
+      try {
+        ForceGraph.current.centerAt(0, 0, 800);
+        ForceGraph.current.zoom(1, 800);
+        setZoomLevel(1);
+      } catch (error) {
+        console.error("Error during graph centering:", error);
+      }
+    } else {
+      console.warn("Graph reference not available for centering");
     }
   };
+
   const toggleInteractionMode = () => {
     setInteractionMode((prev) => (prev === "select" ? "pan" : "select"));
   };
@@ -567,14 +753,14 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
       const linkForce = fg.d3Force("link");
       if (linkForce) {
         // Check if the force exists before configuring
-        linkForce.distance(200).strength(0.15);
+        linkForce.distance(150).strength(0.2);
       }
 
       // Configure charge force (repulsion)
       const chargeForce = fg.d3Force("charge");
       if (chargeForce) {
         // Check if the force exists before configuring
-        chargeForce.strength(-200); // Increased from -120 to -200 for stronger repulsion
+        chargeForce.strength(-200); // Moderate repulsion
       }
 
       // Configure center force to keep graph centered
@@ -587,17 +773,17 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
       // Make zoom more subtle for mousewheel/trackpad
       if (fg.__zoomObj) {
         // Original zoom is typically around 0.1-0.2
-        // Make it 10-20x more subtle by dividing by 15
+        // Make it even more subtle by dividing by 30 instead of 15
         fg.__zoomObj.wheelDelta = (event) => {
-          return (-event.deltaY * 0.01) / 15;
+          return (-event.deltaY * 0.01) / 30;
         };
       }
 
-      // Start with high energy simulation
+      // Start with moderate energy simulation
       const simulation = fg.d3Force();
-      if (simulation) {
-        // Higher alpha makes the simulation more energetic
-        simulation.alpha(0.8).alphaTarget(0).restart();
+      if (simulation && typeof simulation.alpha === "function") {
+        // Moderate alpha makes the simulation less energetic
+        simulation.alpha(0.6).alphaTarget(0).restart();
 
         // Manually run a few ticks to get initial positions
         for (let i = 0; i < 10; i++) {
@@ -696,7 +882,10 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
 
         if (cachedGraph) {
           console.log(`Loaded cached graph for ${bookmark.mainConcept}`);
-          setGraphData(cachedGraph);
+
+          // Create a unique URL state key and mark it as processed to prevent loops
+          const urlStateKey = `${bookmark.mainConcept}-${bookmark.nodeId}-explore`;
+          processedUrlStatesRef.current.add(urlStateKey);
 
           // Update URL params to reflect the new root concept
           updateUrlParams({
@@ -705,9 +894,11 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
             explorerTab: "explore",
           });
 
+          // Set graph data
+          setGraphData(cachedGraph);
+
           // Reheat the graph
           setTimeout(reheatForceSimulation, 200);
-          setTimeout(reheatForceSimulation, 1000);
         } else {
           // If no cached graph, generate a new one
           console.log(
@@ -717,7 +908,10 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
             bookmark.mainConcept,
             selectedModel.id,
           );
-          setGraphData(result);
+
+          // Create a unique URL state key and mark it as processed to prevent loops
+          const urlStateKey = `${bookmark.mainConcept}-${bookmark.nodeId}-explore`;
+          processedUrlStatesRef.current.add(urlStateKey);
 
           // Update URL params to reflect the new root concept
           updateUrlParams({
@@ -726,12 +920,14 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
             explorerTab: "explore",
           });
 
+          // Set graph data
+          setGraphData(result);
+
           // Cache the newly generated graph
           await cacheKnowledgeGraph(bookmark.mainConcept, result);
 
           // Reheat the graph
           setTimeout(reheatForceSimulation, 200);
-          setTimeout(reheatForceSimulation, 1000);
         }
       } catch (error) {
         console.error(
@@ -743,6 +939,10 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
       }
     } else {
       // Even if we're using the same graph, we should update URL params to ensure the node is reflected
+      // Create a unique URL state key and mark it as processed to prevent loops
+      const urlStateKey = `${bookmark.mainConcept || searchQuery}-${bookmark.nodeId}-explore`;
+      processedUrlStatesRef.current.add(urlStateKey);
+
       updateUrlParams({
         node: bookmark.nodeId,
         explorerTab: "explore",
@@ -767,11 +967,11 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
     // Find and highlight the node in the graph
     setTimeout(() => {
       const node = graphData.nodes.find((n) => n.id === bookmark.nodeId);
-      if (node && graphRef.current) {
+      if (node && ForceGraph.current) {
         // If the node exists in the current graph, center on it
         if (node.x !== undefined && node.y !== undefined) {
-          graphRef.current.centerAt(node.x, node.y, 1000);
-          graphRef.current.zoom(zoomLevel * 1.05, 1000);
+          ForceGraph.current.centerAt(node.x, node.y, 1000);
+          ForceGraph.current.zoom(zoomLevel * 1.05, 1000);
         }
 
         // Highlight the node
@@ -818,19 +1018,34 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
   const updateUrlParams = (params: Record<string, string>) => {
     if (typeof window === "undefined") return;
 
-    const url = new URL(window.location.href);
+    // Get current URL and parameters
+    const currentUrl = new URL(window.location.href);
+    const newUrl = new URL(window.location.href);
+    let hasChanges = false;
 
     // Update params
     Object.entries(params).forEach(([key, value]) => {
-      if (value) {
-        url.searchParams.set(key, value);
-      } else {
-        url.searchParams.delete(key);
+      const currentValue = currentUrl.searchParams.get(key);
+
+      // Only update if the value is different
+      if (value !== currentValue) {
+        hasChanges = true;
+        if (value) {
+          newUrl.searchParams.set(key, value);
+        } else {
+          newUrl.searchParams.delete(key);
+        }
       }
     });
 
-    // Use history API to update URL without navigation
-    window.history.pushState({}, "", url.toString());
+    // Only update history if something has changed
+    if (hasChanges) {
+      // Use history API to update URL without navigation
+      window.history.pushState({}, "", newUrl.toString());
+
+      // Log the URL change
+      console.log(`URL updated: ${newUrl.toString()}`);
+    }
   };
 
   // Handle node click - now updateUrlParams is defined before this function
@@ -868,17 +1083,21 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
 
       // Update URL with the selected node - but only if we're on the explore tab
       if (activeTab === "explore") {
+        // Mark this URL state as processed to prevent infinite loops
+        const urlStateKey = `${searchQuery}-${nodeObj.id}-explore`;
+        processedUrlStatesRef.current.add(urlStateKey);
+
         updateUrlParams({ node: nodeObj.id });
       }
 
       // Center on the node if centerFocusedNode is true
-      if (centerFocusedNode && graphRef.current) {
+      if (centerFocusedNode && ForceGraph.current) {
         const distance = 40;
         const distRatio =
           1 + distance / Math.hypot(nodeObj.x || 0, nodeObj.y || 0);
         if (nodeObj.x !== undefined && nodeObj.y !== undefined) {
-          graphRef.current.centerAt(nodeObj.x, nodeObj.y, 1000);
-          graphRef.current.zoom(zoomLevel * 1.05, 1000); // More subtle zoom
+          ForceGraph.current.centerAt(nodeObj.x, nodeObj.y, 1000);
+          ForceGraph.current.zoom(zoomLevel * 1.05, 1000); // More subtle zoom
         }
       }
 
@@ -886,40 +1105,63 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
         console.log(
           `Generating content using model: ${selectedModel.name} (${selectedModel.id})`,
         );
-        console.log(`Node: ${nodeObj.name || nodeObj.id}`);
+        console.log(
+          `Node: ${nodeObj.name || nodeObj.id} in context of ${searchQuery}`,
+        );
+
+        // Create a unique article ID that includes the context
+        const articleId = `article-${nodeObj.id}-1-${selectedModel.id}-${searchQuery}`;
 
         // Generate content using the selected model
         let content;
+
+        // Check if we have cached content for this exact node+context combination
         try {
-          content = await generateNodeContent(
-            nodeObj,
-            searchQuery,
-            selectedModel.id,
-            1,
+          const cachedArticles = await getAllBookmarks();
+          const cachedArticle = cachedArticles.find(
+            (article) =>
+              article.nodeId === nodeObj.id &&
+              article.mainConcept === searchQuery &&
+              article.detailLevel === 1,
           );
 
-          console.log("Content generated successfully:");
-          console.log(
-            content.slice(0, 100) +
-              "..." +
-              (content.length > 100 ? ` (${content.length} chars)` : ""),
-          );
+          if (cachedArticle) {
+            console.log(
+              `Found cached content for ${nodeObj.name || nodeObj.id} in context of ${searchQuery}`,
+            );
+            content = cachedArticle.content;
+          } else {
+            // If no cached content, generate new content
+            content = await generateNodeContent(
+              nodeObj,
+              searchQuery,
+              selectedModel.id,
+              1,
+            );
 
-          // Cache the generated content along with the search query
-          if (content && searchQuery) {
-            try {
-              await cacheArticle({
-                id: `article-${nodeObj.id}-1-${selectedModel.id}`,
-                nodeId: nodeObj.id,
-                concept: searchQuery,
-                title: nodeObj.name || nodeObj.id,
-                content: content,
-                detailLevel: 1,
-                timestamp: Date.now(),
-                mainConcept: searchQuery,
-              });
-            } catch (cacheError) {
-              console.error("Error caching article content:", cacheError);
+            console.log("Content generated successfully:");
+            console.log(
+              content.slice(0, 100) +
+                "..." +
+                (content.length > 100 ? ` (${content.length} chars)` : ""),
+            );
+
+            // Cache the generated content along with the search query
+            if (content && searchQuery) {
+              try {
+                await cacheArticle({
+                  id: articleId,
+                  nodeId: nodeObj.id,
+                  concept: searchQuery,
+                  title: nodeObj.name || nodeObj.id,
+                  content: content,
+                  detailLevel: 1,
+                  timestamp: Date.now(),
+                  mainConcept: searchQuery,
+                });
+              } catch (cacheError) {
+                console.error("Error caching article content:", cacheError);
+              }
             }
           }
         } catch (apiError) {
@@ -949,8 +1191,15 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
           content = `# ${nodeObj.name || nodeObj.id}\n\n${content}`;
         }
 
+        // Add context information to the node object before updating
+        const contextNode = {
+          ...nodeObj,
+          mainConcept: searchQuery,
+          isMainEntry: nodeObj.id === searchQuery, // Flag if this is a main entry or subnode
+        };
+
         // Update node with the content
-        updateNodeWithContent(nodeObj, content);
+        updateNodeWithContent(contextNode, content);
       } catch (err) {
         console.error("Error fetching node summary:", err);
 
@@ -1038,6 +1287,17 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
       const nodeParam = urlParams.get("node");
       const tabParam = urlParams.get("explorerTab");
 
+      // Create a unique key for this URL state
+      const urlStateKey = `${queryParam || ""}-${nodeParam || ""}-${tabParam || ""}`;
+
+      // Skip if we've already processed this exact URL state to prevent infinite loops
+      if (processedUrlStatesRef.current.has(urlStateKey)) {
+        return;
+      }
+
+      // Mark this URL state as processed
+      processedUrlStatesRef.current.add(urlStateKey);
+
       // Set correct tab first (this won't trigger a re-render if tab is the same)
       if (
         tabParam === "explore" ||
@@ -1088,8 +1348,10 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
         `Loading from URL params: query=${queryParam}${nodeParam ? `, node=${nodeParam}` : ""}`,
       );
 
-      // Set the search query (but don't load yet)
+      // Set the search query state
       setSearchQuery(queryParam);
+      // Also update the input value when loading from URL
+      setInputValue(queryParam);
 
       // Only show loading indicator if we don't have graph data already
       if (graphData.nodes.length === 0) {
@@ -1235,14 +1497,122 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
 
     loadFromUrlParams();
 
-    // This effect should not depend on handleNodeClick to avoid infinite loops
-  }, [
-    selectedModel.id,
-    selectedModel.name,
-    activeTab,
-    graphData.nodes,
-    selectedNode,
-  ]);
+    // This effect should run once on mount and then only when the URL changes
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Add a separate effect to handle URL changes
+  useEffect(() => {
+    const handleUrlChange = () => {
+      // Reset the processed states when URL changes
+      processedUrlStatesRef.current.clear();
+
+      // Now re-run the loadFromUrlParams
+      const loadFromUrlParams = async () => {
+        // Only run in browser environment
+        if (typeof window === "undefined") return;
+
+        // Get URL search parameters
+        const urlParams = new URLSearchParams(window.location.search);
+        const queryParam = urlParams.get("q");
+        const nodeParam = urlParams.get("node");
+        const tabParam = urlParams.get("explorerTab");
+
+        // Create a unique key for this URL state
+        const urlStateKey = `${queryParam || ""}-${nodeParam || ""}-${tabParam || ""}`;
+
+        // Skip if we've already processed this exact URL state
+        if (processedUrlStatesRef.current.has(urlStateKey)) {
+          return;
+        }
+
+        // Mark this URL state as processed
+        processedUrlStatesRef.current.add(urlStateKey);
+
+        // Set correct tab first
+        if (
+          tabParam === "explore" ||
+          tabParam === "bookmarks" ||
+          tabParam === "log"
+        ) {
+          if (tabParam !== activeTab) {
+            setActiveTab(tabParam);
+
+            const currentTab = tabParam as "explore" | "bookmarks" | "log";
+            if (currentTab === "bookmarks" || currentTab === "log") {
+              setSelectedNode(null);
+              setSummaryText("");
+              setSummaryLoading(false);
+
+              if (currentTab === "bookmarks") {
+                loadBookmarks();
+              } else if (currentTab === "log") {
+                loadGraphLogs();
+              }
+
+              return;
+            }
+          }
+        }
+
+        // If we don't have a query parameter, don't try to load a graph
+        if (!queryParam) {
+          return;
+        }
+
+        // Check if we're changing to a new root concept
+        const isNewConcept = searchQuery !== queryParam;
+
+        // Set the search query
+        if (isNewConcept) {
+          setSearchQuery(queryParam);
+          // Also update the input value for consistency when navigating
+          setInputValue(queryParam);
+
+          // Clear selected node when changing to a new concept if there's no node param
+          if (!nodeParam) {
+            setSelectedNode(null);
+            setSummaryText("");
+            setSummaryLoading(false);
+          }
+        }
+
+        // Only handle changing nodes when staying on the same graph
+        if (
+          graphData.nodes.length > 0 &&
+          graphData.nodes[0].id === queryParam &&
+          nodeParam
+        ) {
+          const currentNodeId = selectedNode?.id;
+
+          // Only change the node if needed
+          if (nodeParam !== currentNodeId) {
+            const node = graphData.nodes.find((n) => n.id === nodeParam);
+            if (node) {
+              handleNodeClick(node);
+            }
+          }
+        } else if (isNewConcept && graphData.nodes.length === 0) {
+          // If changing to a new concept and we don't have graph data, trigger a search
+          handleSearch(queryParam, false, false);
+        }
+      };
+
+      loadFromUrlParams();
+    };
+
+    // Listen for popstate events (back/forward navigation)
+    window.addEventListener("popstate", handleUrlChange);
+
+    // Initial URL handling
+    handleUrlChange();
+
+    return () => {
+      window.removeEventListener("popstate", handleUrlChange);
+    };
+    // Only depends on necessary values and functions
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, searchQuery, graphData.nodes, handleNodeClick]);
 
   // Modify the reheat effect when graph data changes
   useEffect(() => {
@@ -1354,16 +1724,21 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
           <input
             ref={searchInputRef}
             type="text"
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            onClick={() => setShowSearchHistory(true)}
+            value={inputValue}
+            onChange={(e) => setInputValue(e.target.value)}
+            onClick={() => {
+              loadSearchHistory();
+              setShowSearchHistory(true);
+            }}
             placeholder="Enter a concept to explore (e.g., quantum physics, machine learning)"
             className="w-full rounded-md border border-slate-600 bg-slate-700 py-2 pl-10 pr-4 focus:outline-none focus:ring-2 focus:ring-blue-500"
             onKeyDown={async (e) => {
               if (e.key === "Enter") {
                 e.preventDefault();
                 try {
-                  await handleSearch();
+                  // Update searchQuery from input when submitting
+                  setSearchQuery(inputValue);
+                  await handleSearch(inputValue);
                 } catch (err) {
                   console.error("Error executing search:", err);
                 }
@@ -1377,15 +1752,15 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
           {showSearchHistory && searchHistory.length > 0 && (
             <div className="absolute z-50 mt-1 w-full rounded-md border border-slate-600 bg-slate-800 shadow-lg">
               <ul className="max-h-60 overflow-auto py-1">
-                {searchHistory.map((item, index) => (
+                {searchHistory.map((item) => (
                   <li
-                    key={index}
+                    key={item.id}
                     className="flex cursor-pointer items-center justify-between px-4 py-2 hover:bg-slate-700"
-                    onClick={async (e) => {
-                      e.preventDefault();
-                      // Set the search query
+                    onClick={async () => {
+                      // Set both input value and search query
+                      setInputValue(item.query);
                       setSearchQuery(item.query);
-                      // Execute the search first
+                      // Execute the search
                       try {
                         await handleSearch(item.query);
                       } catch (err) {
@@ -1398,7 +1773,10 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
                     <span className="truncate">{item.query}</span>
                     <button
                       className="ml-2 rounded-full p-1 hover:bg-slate-600"
-                      onClick={(e) => removeFromHistory(item, e)}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        removeFromHistory(item, e);
+                      }}
                       title="Remove from history"
                     >
                       <X size={16} className="text-slate-400" />
@@ -1413,15 +1791,17 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
           <button
             onClick={async () => {
               try {
-                await handleSearch();
+                // Update searchQuery from input when clicking button
+                setSearchQuery(inputValue);
+                await handleSearch(inputValue);
                 // Close the dropdown after the search is completed
                 setShowSearchHistory(false);
               } catch (err) {
                 console.error("Error executing search:", err);
               }
             }}
-            disabled={isLoading || !searchQuery.trim()}
-            className={`rounded-md px-5 py-2 font-medium transition-colors ${isLoading || !searchQuery.trim() ? "cursor-not-allowed bg-slate-600 text-slate-300" : "bg-blue-600 text-white hover:bg-blue-700"}`}
+            disabled={isLoading || !inputValue.trim()}
+            className={`rounded-md px-5 py-2 font-medium transition-colors ${isLoading || !inputValue.trim() ? "cursor-not-allowed bg-slate-600 text-slate-300" : "bg-blue-600 text-white hover:bg-blue-700"}`}
           >
             {isLoading ? "Loading..." : "Explore"}
           </button>
@@ -1529,6 +1909,25 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
                 <Focus size={20} />
               </motion.button>
 
+              {/* Hard reload button */}
+              <motion.button
+                whileHover={{
+                  scale: 1.1,
+                }}
+                whileTap={{
+                  scale: 0.95,
+                }}
+                onClick={handleHardReload}
+                className="rounded-md p-2 transition-colors hover:bg-slate-700"
+                title="Hard Reload (Force Regeneration)"
+                disabled={!searchQuery.trim() || isLoading}
+              >
+                <RefreshCw
+                  size={20}
+                  className={isLoading ? "text-slate-500" : ""}
+                />
+              </motion.button>
+
               {/* Graph reheat button - only show when graph has nodes */}
               {graphData.nodes.length > 0 && (
                 <motion.button
@@ -1538,11 +1937,13 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
                   whileTap={{
                     scale: 0.95,
                   }}
-                  onClick={reheatForceSimulation}
+                  onClick={() => {
+                    expandGraphToFillSpace();
+                  }}
                   className="rounded-md p-2 transition-colors hover:bg-slate-700"
-                  title="Reheat Graph Layout (if nodes appear stuck)"
+                  title="Adjust graph layout to improve spacing"
                 >
-                  <RefreshCw size={20} />
+                  <GrapeIcon size={20} />
                 </motion.button>
               )}
             </div>
@@ -1687,8 +2088,8 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
                 const label = node.name || node.id || "";
                 const fontSize = 12 / globalScale;
                 const nodeSize = node.val
-                  ? Math.sqrt(Math.max(0, node.val || 1)) * 4
-                  : 8; // Base size calculation
+                  ? Math.sqrt(Math.max(0, node.val || 1)) * 0.4
+                  : 0.8; // Reduced to 1/10th of original size
 
                 // Draw the main node circle
                 ctx.beginPath();
@@ -1710,7 +2111,7 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
                   ctx.arc(
                     node.x || 0,
                     node.y || 0,
-                    nodeSize + 2,
+                    nodeSize + 0.2,
                     0,
                     2 * Math.PI,
                   );

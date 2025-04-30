@@ -6,18 +6,10 @@ import {
   removeBookmark,
 } from "@/lib/indexeddb";
 import { NodeObject } from "@/lib/types";
-import { AnimatePresence, motion } from "framer-motion";
-import {
-  Bookmark,
-  BookmarkCheck,
-  ChevronDown,
-  ChevronUp,
-  ExternalLink,
-  Link,
-  Maximize2,
-} from "lucide-react";
-import React, { useEffect, useState } from "react";
-import ReactMarkdown from "react-markdown";
+import { ExternalLink } from "lucide-react";
+import { marked } from "marked";
+import React, { useCallback, useEffect, useState } from "react";
+import MarkdownContent from "./MarkdownContent";
 
 interface NodeDetailProps {
   node: NodeObject;
@@ -67,6 +59,11 @@ const NodeDetail: React.FC<NodeDetailProps> = ({
   const [isBookmarked, setIsBookmarked] = useState(false);
   const [isBookmarkLoading, setIsBookmarkLoading] = useState(false);
   const [showShareTooltip, setShowShareTooltip] = useState(false);
+  const [html, setHtml] = useState("");
+  const [relatedNodes, setRelatedNodes] = useState<string[]>([]);
+
+  // Check if this is a main entry or a subnode
+  const isMainEntry = node.id === mainConcept || node.isMainEntry === true;
 
   // Debug information to understand what content is available
   useEffect(() => {
@@ -83,15 +80,28 @@ const NodeDetail: React.FC<NodeDetailProps> = ({
   }, [node, summary, detailLevel]);
 
   useEffect(() => {
+    if (summary) {
+      const parsed = marked.parse(summary);
+      setHtml(parsed);
+
+      // Extract links from markdown
+      const regex = /\[([^\]]+)\]\(node:([^)]+)\)/g;
+      const matches = [...summary.matchAll(regex)];
+      const linkedNodes = matches.map((match) => match[2]);
+      setRelatedNodes(linkedNodes);
+    }
+  }, [summary]);
+
+  // Check if the node is bookmarked
+  useEffect(() => {
+    if (!node || !node.id) return;
+
     const checkBookmarkStatus = async () => {
-      if (node && node.id) {
-        try {
-          const bookmarked = await isArticleBookmarked(node.id);
-          setIsBookmarked(bookmarked);
-        } catch (error) {
-          console.error("Error checking bookmark status:", error);
-          setIsBookmarked(false);
-        }
+      try {
+        const isMarked = await isArticleBookmarked(node.id);
+        setIsBookmarked(isMarked);
+      } catch (error) {
+        console.error("Error checking bookmark status:", error);
       }
     };
 
@@ -106,7 +116,7 @@ const NodeDetail: React.FC<NodeDetailProps> = ({
     onFocusNode && onFocusNode(node.id);
   };
 
-  const toggleBookmark = async () => {
+  const handleToggleBookmark = useCallback(async () => {
     if (!node || !node.id || (!node.content && !summary)) return;
 
     setIsBookmarkLoading(true);
@@ -114,10 +124,25 @@ const NodeDetail: React.FC<NodeDetailProps> = ({
       if (isBookmarked) {
         await removeBookmark(node.id);
         setIsBookmarked(false);
+        if (onBookmarkToggle) {
+          onBookmarkToggle(false, node);
+        }
       } else {
         // Create formatted content with proper title for bookmark
         const contentToSave = node.content || summary;
         const nodeTitle = node.name || node.id;
+
+        // Determine the correct mainConcept based on whether this is a main entry
+        // If it's a main entry, use the node's own id as the mainConcept
+        const bookmarkMainConcept = isMainEntry ? node.id : mainConcept || "";
+
+        // Create a description that indicates if this is a main concept or related node
+        let bookmarkDescription = node.description || "";
+
+        // If this is a related node (not a main entry), add context information
+        if (!isMainEntry && mainConcept) {
+          bookmarkDescription = `Related concept to ${mainConcept}${bookmarkDescription ? ` - ${bookmarkDescription}` : ""}`;
+        }
 
         // Use the object format for bookmarking
         await bookmarkArticle({
@@ -125,23 +150,21 @@ const NodeDetail: React.FC<NodeDetailProps> = ({
           nodeId: node.id,
           title: nodeTitle,
           content: contentToSave,
-          mainConcept: mainConcept || "",
+          mainConcept: bookmarkMainConcept,
           timestamp: Date.now(),
-          description: node.description || "",
+          description: bookmarkDescription,
         });
         setIsBookmarked(true);
-      }
-
-      // Notify parent component about bookmark change
-      if (onBookmarkToggle) {
-        onBookmarkToggle(!isBookmarked, node);
+        if (onBookmarkToggle) {
+          onBookmarkToggle(true, node);
+        }
       }
     } catch (error) {
       console.error("Error toggling bookmark:", error);
     } finally {
       setIsBookmarkLoading(false);
     }
-  };
+  }, [node, summary, isBookmarked, onBookmarkToggle, mainConcept, isMainEntry]);
 
   // Generate a shareable link for the current node
   const generateShareableLink = (): string => {
@@ -207,121 +230,120 @@ const NodeDetail: React.FC<NodeDetailProps> = ({
   }
 
   return (
-    <div className="node-detail relative mb-4 rounded-lg bg-white p-4 shadow-lg dark:bg-gray-800">
-      <div className="flex items-start justify-between">
-        <h2 className="mb-2 flex-1 text-xl font-semibold">{node.name}</h2>
-        <div className="flex gap-2">
-          {isBookmarked && (
-            <div className="relative">
-              <button
-                onClick={copyShareableLink}
-                className="text-gray-500 transition-colors hover:text-blue-500 focus:outline-none"
-                title="Copy shareable link"
-              >
-                <Link size={20} />
-              </button>
-              {showShareTooltip && (
-                <div className="absolute right-0 top-full z-10 mt-1 rounded bg-slate-700 px-2 py-1 text-xs text-white shadow-lg">
-                  Link copied!
-                </div>
-              )}
-            </div>
+    <div className="flex h-full flex-col overflow-hidden">
+      <div className="mb-2 flex items-center justify-between border-b border-slate-700 bg-slate-800 px-4 py-3">
+        <h2 className="text-lg font-medium text-white">
+          {node.name || node.id}
+        </h2>
+        <button
+          onClick={handleToggleBookmark}
+          disabled={isBookmarkLoading}
+          className={`rounded-full p-1.5 transition-colors ${
+            isBookmarked
+              ? "text-yellow-400 hover:bg-slate-700"
+              : "text-slate-400 hover:bg-slate-700 hover:text-white"
+          }`}
+          title={isBookmarked ? "Remove bookmark" : "Add bookmark"}
+        >
+          {isBookmarkLoading ? (
+            <div className="h-5 w-5 animate-spin rounded-full border-2 border-slate-300 border-t-transparent"></div>
+          ) : (
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              width="20"
+              height="20"
+              viewBox="0 0 24 24"
+              fill={isBookmarked ? "currentColor" : "none"}
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              className={isBookmarked ? "fill-yellow-400" : ""}
+            >
+              <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"></path>
+            </svg>
           )}
-          <button
-            onClick={toggleBookmark}
-            disabled={isBookmarkLoading}
-            className="text-gray-500 transition-colors hover:text-yellow-500 focus:outline-none"
-            title={isBookmarked ? "Remove bookmark" : "Bookmark this article"}
-          >
-            {isBookmarked ? (
-              <BookmarkCheck size={20} className="text-yellow-500" />
-            ) : (
-              <Bookmark size={20} />
-            )}
-          </button>
-          <button
-            onClick={handleFocusNode}
-            className="text-gray-500 transition-colors hover:text-blue-500 focus:outline-none"
-            title="Focus on this node in the graph"
-          >
-            <Maximize2 size={20} />
-          </button>
-          <button
-            onClick={toggleExpanded}
-            className="text-gray-500 transition-colors hover:text-blue-500 focus:outline-none"
-            title={isExpanded ? "Collapse content" : "Expand content"}
-          >
-            {isExpanded ? <ChevronUp size={20} /> : <ChevronDown size={20} />}
-          </button>
-        </div>
+        </button>
       </div>
 
+      {/* If this is a subnode and not a main entry, show a button to view it as main concept */}
+      {!isMainEntry && (
+        <div className="mb-2 rounded-md bg-blue-900/20 px-4 py-2 text-sm">
+          <div className="flex items-center justify-between">
+            <span>
+              Viewing <strong>{node.name || node.id}</strong> in the context of{" "}
+              <strong>{mainConcept}</strong>
+            </span>
+            <button
+              onClick={() => onExploreNode(node)}
+              className="ml-2 flex items-center rounded-md bg-blue-700 px-2 py-1 text-xs font-medium text-white hover:bg-blue-600"
+            >
+              <ExternalLink size={14} className="mr-1" />
+              View main entry
+            </button>
+          </div>
+        </div>
+      )}
+
       {isLoading ? (
-        <div className="mt-4 flex items-center justify-center">
-          <div className="h-5 w-5 animate-spin rounded-full border-2 border-gray-500 border-t-transparent"></div>
-          <span className="ml-2 text-sm text-gray-500">Loading content...</span>
+        <div className="flex flex-1 flex-col items-center justify-center p-6">
+          <div className="h-8 w-8 animate-spin rounded-full border-2 border-blue-500 border-t-transparent"></div>
+          <p className="mt-4 text-slate-400">
+            Generating content for {node.name || node.id}...
+          </p>
         </div>
       ) : (
-        <div
-          className={`transition-all duration-300 ${!isExpanded ? "cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-700/50" : ""}`}
-          onClick={!isExpanded ? toggleExpanded : undefined}
-        >
-          <AnimatePresence>
-            {isExpanded ? (
-              <motion.div
-                initial={{ height: 0, opacity: 0 }}
-                animate={{ height: "auto", opacity: 1 }}
-                exit={{ height: 0, opacity: 0 }}
-                transition={{ duration: 0.3 }}
-                className="overflow-hidden"
+        <div className="flex-1 overflow-auto px-4 py-2">
+          <MarkdownContent
+            content={summary}
+            onNodeClick={(nodeId) => {
+              onFocusNode(nodeId);
+            }}
+          />
+
+          {detailLevel < 3 && (
+            <div className="mt-4 flex justify-center">
+              <button
+                onClick={onExpandDetail}
+                className="rounded-md bg-slate-700 px-4 py-2 text-sm text-white hover:bg-slate-600"
               >
-                <div className="prose prose-sm dark:prose-invert mt-2 max-w-none text-gray-700 dark:text-gray-300">
-                  <ReactMarkdown>{content}</ReactMarkdown>
-                </div>
+                Expand details
+              </button>
+            </div>
+          )}
 
-                {/* View main entry button */}
-                <div className="mt-4 border-t border-gray-200 pt-3 dark:border-gray-700">
-                  <a
-                    href={getMainEntryUrl()}
-                    onClick={handleViewMainEntry}
-                    className="flex items-center text-sm text-blue-500 hover:text-blue-600 dark:text-blue-400 dark:hover:text-blue-300"
+          {relatedNodes.length > 0 && (
+            <div className="mb-4 mt-8">
+              <h3 className="mb-2 font-medium text-slate-300">
+                Related Topics
+              </h3>
+              <div className="flex flex-wrap gap-2">
+                {relatedNodes.map((nodeId) => (
+                  <button
+                    key={nodeId}
+                    onClick={() => onFocusNode(nodeId)}
+                    className="flex items-center rounded-full bg-slate-700 px-3 py-1.5 text-xs hover:bg-slate-600"
                   >
-                    <ExternalLink size={16} className="mr-1" />
-                    View main entry for {node.name}
-                  </a>
-                </div>
-              </motion.div>
-            ) : (
-              <div className="group">
-                <div className="prose prose-sm dark:prose-invert mt-2 text-gray-700 dark:text-gray-300">
-                  {(() => {
-                    // Skip titles/headers at the beginning to get to actual content
-                    const paragraphs = content
-                      .split("\n\n")
-                      .filter((p) => !p.trim().startsWith("#"));
-                    if (paragraphs.length > 0) {
-                      // Get first real paragraph of content - show it all
-                      const firstPara = paragraphs[0].trim();
-                      return <ReactMarkdown>{firstPara}</ReactMarkdown>;
-                    } else {
-                      // Fallback if no paragraphs found - show first 500 chars
-                      return (
-                        <ReactMarkdown>
-                          {content.substring(0, 500)}
-                        </ReactMarkdown>
-                      );
-                    }
-                  })()}
-                </div>
-
-                {/* Visual indicator to expand */}
-                <div className="mt-2 flex items-center justify-center text-slate-400 group-hover:text-blue-500">
-                  <ChevronDown size={16} className="mr-1" />
-                  <span className="text-xs">Click to read more</span>
-                </div>
+                    {nodeId}
+                    <svg
+                      xmlns="http://www.w3.org/2000/svg"
+                      width="14"
+                      height="14"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      className="ml-1"
+                    >
+                      <polyline points="9 18 15 12 9 6"></polyline>
+                    </svg>
+                  </button>
+                ))}
               </div>
-            )}
-          </AnimatePresence>
+            </div>
+          )}
         </div>
       )}
     </div>

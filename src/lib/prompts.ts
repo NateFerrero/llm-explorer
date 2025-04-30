@@ -15,6 +15,6 @@ The number should represent the relevance or closeness to ${concept}, where 100 
 
 Be specific, varied, and comprehensive, covering different aspects and applications of ${concept}. Include both broader/parent concepts and narrower/specialized ones.
 
-Always return a list of concepts, even if there are only 1 or 2. If the prompt is long, return examples of what is being asked. Get creative to come up with at least 10-20 possible connections, even if direct connections are not obvious.
+If the prompt seems like the title of a list, return a list of potential items in the list. Try to come up with at least 10-20 possible connections, even if direct connections are not obvious.
 `;
 }

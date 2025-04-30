@@ -23,10 +23,11 @@ export interface BookmarkedArticle {
   id: string;
   nodeId: string;
   title: string;
+  description?: string;
   content: string;
   timestamp: number;
   mainConcept?: string;
-  description?: string;
+  detailLevel?: number;
   imageUrl?: string;
 }
 
@@ -215,101 +216,36 @@ export async function getCachedKnowledgeGraph(
 }
 
 // Article cache functions
-export async function cacheArticle(
-  articleOrId: CachedArticle | string,
-  concept?: string,
-  content?: string,
-  detailLevel?: number,
-  modelId?: string,
-): Promise<void> {
+export async function cacheArticle(article: {
+  id: string;
+  nodeId: string;
+  concept: string;
+  title: string;
+  content: string;
+  detailLevel: number;
+  timestamp: number;
+  mainConcept: string;
+  description?: string;
+}): Promise<void> {
   try {
-    const db = await initDB();
+    // Convert to a bookmarked article format
+    const bookmark: BookmarkedArticle = {
+      id: article.id,
+      nodeId: article.nodeId,
+      title: article.title,
+      content: article.content,
+      timestamp: article.timestamp,
+      mainConcept: article.mainConcept,
+      description: article.description,
+      detailLevel: article.detailLevel,
+    };
 
-    // Check if ARTICLE_STORE exists
-    if (!db.objectStoreNames.contains(ARTICLE_STORE)) {
-      console.log("Article store not found when caching article");
-      await recreateDatabase();
-      return;
-    }
-
-    const tx = db.transaction(ARTICLE_STORE, "readwrite");
-    const store = tx.objectStore(ARTICLE_STORE);
-
-    // Handle both object and parameter formats
-    let article: CachedArticle;
-
-    if (typeof articleOrId === "object") {
-      // New format - single object parameter
-      article = articleOrId;
-    } else {
-      // Legacy format - separate parameters
-      if (!concept || !content || detailLevel === undefined) {
-        throw new Error(
-          "Missing required parameters for legacy cacheArticle call",
-        );
-      }
-
-      // Create a proper article object from parameters
-      article = {
-        id: `article-${articleOrId}-${detailLevel}-${modelId || "unknown"}`,
-        nodeId: articleOrId,
-        concept: concept,
-        title: articleOrId,
-        content: content,
-        detailLevel: detailLevel,
-        timestamp: Date.now(),
-      };
-    }
-
-    // Ensure article has an id
-    if (!article.id) {
-      console.log("Article missing id, generating one");
-      article.id = `article-${article.nodeId}-${article.detailLevel}-${Date.now()}`;
-    }
-
-    // Ensure all required fields are present
-    if (!article.nodeId || !article.title || !article.content) {
-      throw new Error(
-        "Required article fields missing: nodeId, title, or content",
-      );
-    }
-
-    await new Promise<void>((resolve, reject) => {
-      const request = store.put(article);
-      request.onsuccess = () => {
-        console.log(`Cached article: ${article.title}`);
-        resolve();
-      };
-      request.onerror = (event) => {
-        console.error("Error caching article:", event);
-        reject(event);
-      };
-    });
+    // Use the bookmarkArticle function to save it
+    await bookmarkArticle(bookmark);
+    console.log(`Cached article for node ${article.nodeId}`);
   } catch (error) {
-    console.error("Failed to cache article:", error);
-
-    // Handle NotFoundError specifically
-    if (error instanceof DOMException && error.name === "NotFoundError") {
-      console.log("Store not found, attempting to recreate database...");
-      // Reset the dbPromise to force recreation
-      dbPromise = null;
-      try {
-        // Try again with a fresh database connection
-        await initDB();
-        return cacheArticle(
-          articleOrId,
-          concept,
-          content,
-          detailLevel,
-          modelId,
-        );
-      } catch (retryError) {
-        console.error(
-          "Failed to cache article after database recreation:",
-          retryError,
-        );
-      }
-    }
+    console.error("Error caching article:", error);
+    throw error;
   }
 }
 
@@ -390,75 +326,23 @@ export async function recreateDatabase(): Promise<void> {
 }
 
 export async function bookmarkArticle(
-  idOrObject: string | BookmarkedArticle,
-  title?: string,
-  content?: string,
-  imageUrl?: string,
+  article: BookmarkedArticle,
 ): Promise<void> {
   try {
     const db = await initDB();
     const tx = db.transaction(BOOKMARK_STORE, "readwrite");
     const store = tx.objectStore(BOOKMARK_STORE);
+    await store.put(article);
 
-    let bookmark: BookmarkedArticle;
-
-    // Handle both formats - object or parameters
-    if (typeof idOrObject === "object") {
-      // Object parameter
-      bookmark = {
-        ...idOrObject,
-        // Ensure required fields
-        nodeId: idOrObject.nodeId,
-        id: idOrObject.id || idOrObject.nodeId,
-        timestamp: idOrObject.timestamp || Date.now(),
-      };
-    } else {
-      // Parameters format
-      if (!title || !content) {
-        throw new Error("Missing required parameters for bookmarkArticle");
-      }
-
-      bookmark = {
-        id: idOrObject,
-        nodeId: idOrObject,
-        title,
-        content,
-        timestamp: Date.now(),
-        imageUrl,
-      };
-    }
-
-    return new Promise((resolve, reject) => {
-      const request = store.put(bookmark);
-      request.onsuccess = () => {
-        console.log(`Bookmarked article: ${bookmark.title}`);
-        resolve();
-      };
-      request.onerror = (event) => {
-        console.error("Error bookmarking article:", event);
-        reject(event);
-      };
+    // Use a promise to wait for transaction completion
+    await new Promise<void>((resolve, reject) => {
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
     });
+
+    console.log("Article bookmarked successfully:", article.id);
   } catch (error) {
-    console.error("Failed to bookmark article:", error);
-
-    // Handle NotFoundError specifically
-    if (error instanceof DOMException && error.name === "NotFoundError") {
-      console.log("Store not found, attempting to recreate database...");
-      // Reset the dbPromise to force recreation
-      dbPromise = null;
-      try {
-        // Try again with a fresh database connection
-        return bookmarkArticle(idOrObject, title, content, imageUrl);
-      } catch (retryError) {
-        console.error(
-          "Failed to bookmark after database recreation:",
-          retryError,
-        );
-        throw retryError;
-      }
-    }
-
+    console.error("Error bookmarking article:", error);
     throw error;
   }
 }
