@@ -17,6 +17,7 @@ interface CachedArticle {
   detailLevel: number;
   timestamp: number;
   mainConcept?: string;
+  isMainEntry?: boolean;
 }
 
 export interface BookmarkedArticle {
@@ -29,6 +30,7 @@ export interface BookmarkedArticle {
   mainConcept?: string;
   detailLevel?: number;
   imageUrl?: string;
+  isMainEntry?: boolean;
 }
 
 // Add a new interface for graph logs
@@ -52,9 +54,10 @@ export interface SearchHistoryItem {
 let dbPromise: Promise<IDBDatabase> | null = null;
 
 const DB_NAME = "llm-explorer";
-const DB_VERSION = 3;
+const DB_VERSION = 4;
 const GRAPH_STORE = "knowledge-graphs";
 const ARTICLE_STORE = "articles";
+const ARTICLE_CACHE_STORE = "article-cache";
 const BOOKMARK_STORE = "bookmarks";
 const GRAPH_LOG_STORE = "graph-logs";
 const SEARCH_HISTORY_STORE = "search-history";
@@ -112,6 +115,12 @@ export function initDB(): Promise<IDBDatabase> {
         if (!db.objectStoreNames.contains(ARTICLE_STORE)) {
           console.log(`Creating ${ARTICLE_STORE} object store`);
           db.createObjectStore(ARTICLE_STORE, { keyPath: "id" });
+        }
+
+        // Create new store for article cache
+        if (!db.objectStoreNames.contains(ARTICLE_CACHE_STORE)) {
+          console.log(`Creating ${ARTICLE_CACHE_STORE} object store`);
+          db.createObjectStore(ARTICLE_CACHE_STORE, { keyPath: "id" });
         }
 
         // For BOOKMARK_STORE, use 'id' as the keyPath instead of 'nodeId'
@@ -226,22 +235,29 @@ export async function cacheArticle(article: {
   timestamp: number;
   mainConcept: string;
   description?: string;
+  isMainEntry?: boolean;
 }): Promise<void> {
   try {
-    // Convert to a bookmarked article format
-    const bookmark: BookmarkedArticle = {
-      id: article.id,
-      nodeId: article.nodeId,
-      title: article.title,
-      content: article.content,
-      timestamp: article.timestamp,
-      mainConcept: article.mainConcept,
-      description: article.description,
-      detailLevel: article.detailLevel,
-    };
+    const db = await initDB();
 
-    // Use the bookmarkArticle function to save it
-    await bookmarkArticle(bookmark);
+    // Check if the store exists
+    if (!db.objectStoreNames.contains(ARTICLE_CACHE_STORE)) {
+      console.error(`${ARTICLE_CACHE_STORE} store not found`);
+      return;
+    }
+
+    const tx = db.transaction(ARTICLE_CACHE_STORE, "readwrite");
+    const store = tx.objectStore(ARTICLE_CACHE_STORE);
+
+    // Store the article in the cache
+    await store.put(article);
+
+    // Wait for the transaction to complete
+    await new Promise<void>((resolve, reject) => {
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+
     console.log(`Cached article for node ${article.nodeId}`);
   } catch (error) {
     console.error("Error caching article:", error);
@@ -255,31 +271,94 @@ export async function getCachedArticle(
   try {
     const db = await initDB();
 
-    // Check if ARTICLE_STORE exists
-    if (!db.objectStoreNames.contains(ARTICLE_STORE)) {
-      console.log("Article store not found when getting cached article");
-      await recreateDatabase();
-      return null;
+    // First check the article cache store
+    if (db.objectStoreNames.contains(ARTICLE_CACHE_STORE)) {
+      const tx = db.transaction(ARTICLE_CACHE_STORE, "readonly");
+      const store = tx.objectStore(ARTICLE_CACHE_STORE);
+
+      const article = await new Promise<CachedArticle | null>(
+        (resolve, reject) => {
+          const request = store.get(id);
+          request.onsuccess = () => resolve(request.result || null);
+          request.onerror = (event) => {
+            console.error("Error getting cached article:", event);
+            reject(event);
+          };
+        },
+      );
+
+      if (article) {
+        return article;
+      }
     }
 
-    const tx = db.transaction(ARTICLE_STORE, "readonly");
-    const store = tx.objectStore(ARTICLE_STORE);
+    // If not found in cache, check the bookmarks
+    if (db.objectStoreNames.contains(BOOKMARK_STORE)) {
+      const tx = db.transaction(BOOKMARK_STORE, "readonly");
+      const store = tx.objectStore(BOOKMARK_STORE);
 
-    const article = await new Promise<CachedArticle | null>(
-      (resolve, reject) => {
-        const request = store.get(id);
-        request.onsuccess = () => resolve(request.result || null);
-        request.onerror = (event) => {
-          console.error("Error getting cached article:", event);
-          reject(event);
+      const bookmark = await new Promise<BookmarkedArticle | null>(
+        (resolve, reject) => {
+          const request = store.get(id);
+          request.onsuccess = () => resolve(request.result || null);
+          request.onerror = (event) => {
+            console.error("Error getting bookmarked article:", event);
+            reject(event);
+          };
+        },
+      );
+
+      if (bookmark) {
+        // Convert bookmark to cached article format
+        return {
+          id: bookmark.id,
+          nodeId: bookmark.nodeId,
+          concept: bookmark.mainConcept || "",
+          title: bookmark.title,
+          content: bookmark.content,
+          detailLevel: bookmark.detailLevel || 1,
+          timestamp: bookmark.timestamp,
+          mainConcept: bookmark.mainConcept,
+          isMainEntry: bookmark.isMainEntry,
         };
-      },
-    );
+      }
+    }
 
-    return article;
+    // Not found in any store
+    return null;
   } catch (error) {
     console.error("Failed to get cached article:", error);
     return null;
+  }
+}
+
+// Function to get all cached articles
+export async function getAllCachedArticles(): Promise<CachedArticle[]> {
+  try {
+    const db = await initDB();
+
+    // Check if the store exists
+    if (!db.objectStoreNames.contains(ARTICLE_CACHE_STORE)) {
+      console.log("Article cache store not found");
+      return [];
+    }
+
+    const tx = db.transaction(ARTICLE_CACHE_STORE, "readonly");
+    const store = tx.objectStore(ARTICLE_CACHE_STORE);
+
+    const articles = await new Promise<CachedArticle[]>((resolve, reject) => {
+      const request = store.getAll();
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = (event) => {
+        console.error("Error getting cached articles:", event);
+        reject(event);
+      };
+    });
+
+    return articles.sort((a, b) => b.timestamp - a.timestamp);
+  } catch (error) {
+    console.error("Failed to get cached articles:", error);
+    return [];
   }
 }
 
@@ -391,6 +470,12 @@ export async function removeBookmark(id: string): Promise<void> {
 export async function isArticleBookmarked(nodeId: string): Promise<boolean> {
   try {
     const db = await initDB();
+
+    // Make sure we only check the bookmarks store, not the cache
+    if (!db.objectStoreNames.contains(BOOKMARK_STORE)) {
+      return false;
+    }
+
     const tx = db.transaction(BOOKMARK_STORE, "readonly");
     const store = tx.objectStore(BOOKMARK_STORE);
 
@@ -409,24 +494,6 @@ export async function isArticleBookmarked(nodeId: string): Promise<boolean> {
     return !!bookmark;
   } catch (error) {
     console.error("Failed to check if article is bookmarked:", error);
-
-    // Handle NotFoundError specifically
-    if (error instanceof DOMException && error.name === "NotFoundError") {
-      console.log("Store not found, attempting to recreate database...");
-      // Reset the dbPromise to force recreation
-      dbPromise = null;
-      try {
-        // Try again with a fresh database connection
-        return isArticleBookmarked(nodeId);
-      } catch (retryError) {
-        console.error(
-          "Failed to check bookmark status after database recreation:",
-          retryError,
-        );
-        return false;
-      }
-    }
-
     return false;
   }
 }
@@ -673,7 +740,7 @@ export async function updateGraphBookmarkCount(concept: string): Promise<void> {
     });
 
     if (existingLog) {
-      // Update bookmark count
+      // Update existing log
       const updatedLog = {
         ...existingLog,
         bookmarkCount: bookmarksForConcept,
@@ -686,17 +753,16 @@ export async function updateGraphBookmarkCount(concept: string): Promise<void> {
       });
 
       console.log(
-        `Updated bookmark count for "${concept}": ${bookmarksForConcept} bookmarks`,
+        `Updated graph log for "${concept}": ${updatedLog.bookmarkCount} bookmarks`,
       );
-    } else if (bookmarksForConcept > 0) {
-      // Create new log if there are bookmarks but no log yet
-      const now = Date.now();
+    } else {
+      // Create new log
       const newLog: GraphLog = {
         id: graphId,
         concept,
-        lastAccessed: now,
-        createdAt: now,
-        accessCount: 1,
+        lastAccessed: Date.now(),
+        createdAt: Date.now(),
+        accessCount: 0,
         bookmarkCount: bookmarksForConcept,
       };
 
@@ -706,9 +772,7 @@ export async function updateGraphBookmarkCount(concept: string): Promise<void> {
         request.onerror = (event) => reject(event);
       });
 
-      console.log(
-        `Created new graph log for "${concept}" with ${bookmarksForConcept} bookmarks`,
-      );
+      console.log(`Created new graph log for "${concept}"`);
     }
   } catch (error) {
     console.error("Error updating graph bookmark count:", error);
@@ -720,9 +784,9 @@ export async function getAllGraphLogs(): Promise<GraphLog[]> {
   try {
     const db = await initDB();
 
-    // Ensure the store exists
+    // Check if the store exists
     if (!db.objectStoreNames.contains(GRAPH_LOG_STORE)) {
-      console.log("Graph log store not found, returning empty array");
+      console.log("Graph log store not found");
       return [];
     }
 
@@ -731,14 +795,14 @@ export async function getAllGraphLogs(): Promise<GraphLog[]> {
 
     const logs = await new Promise<GraphLog[]>((resolve, reject) => {
       const request = store.getAll();
-      request.onsuccess = () => resolve(request.result || []);
+      request.onsuccess = () => resolve(request.result);
       request.onerror = (event) => {
         console.error("Error getting graph logs:", event);
         reject(event);
       };
     });
 
-    // Sort by last accessed time, most recent first
+    // Sort logs by last accessed date (most recent first)
     return logs.sort((a, b) => b.lastAccessed - a.lastAccessed);
   } catch (error) {
     console.error("Failed to get graph logs:", error);
@@ -746,96 +810,71 @@ export async function getAllGraphLogs(): Promise<GraphLog[]> {
   }
 }
 
-// Function to add a query to search history
+// Function to add an item to search history
 export async function addToSearchHistory(query: string): Promise<void> {
-  if (!query.trim()) return;
-
   try {
     const db = await initDB();
 
-    // Ensure the store exists
+    // Check if the store exists
     if (!db.objectStoreNames.contains(SEARCH_HISTORY_STORE)) {
-      console.log("Search history store not found, skipping");
+      console.error(`${SEARCH_HISTORY_STORE} store not found`);
       return;
     }
 
     const tx = db.transaction(SEARCH_HISTORY_STORE, "readwrite");
     const store = tx.objectStore(SEARCH_HISTORY_STORE);
 
-    // Check if this exact query already exists
-    const existingQueries = await getAllSearchHistory();
-    const exists = existingQueries.some(
-      (item) => item.query.toLowerCase() === query.toLowerCase(),
-    );
+    // Create a unique ID based on the query
+    const id = `search-${query.toLowerCase().replace(/\s+/g, "-")}`;
 
-    if (!exists) {
-      const historyItem: SearchHistoryItem = {
-        id: `query-${Date.now()}`,
-        query: query,
-        timestamp: Date.now(),
-      };
+    // Create the history item
+    const historyItem: SearchHistoryItem = {
+      id,
+      query,
+      timestamp: Date.now(),
+    };
 
-      await new Promise<void>((resolve, reject) => {
-        const request = store.add(historyItem);
-        request.onsuccess = () => {
-          console.log(`Added "${query}" to search history`);
-          resolve();
-        };
-        request.onerror = (event) => {
-          console.error("Error adding to search history:", event);
-          reject(event);
-        };
-      });
+    // Store the history item
+    await store.put(historyItem);
 
-      // Limit history to 20 items by removing oldest if needed
-      if (existingQueries.length >= 20) {
-        // Sort by timestamp (oldest first)
-        const sortedQueries = existingQueries.sort(
-          (a, b) => a.timestamp - b.timestamp,
-        );
+    // Wait for the transaction to complete
+    await new Promise<void>((resolve, reject) => {
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
 
-        // Remove oldest items
-        const itemsToRemove = sortedQueries.slice(
-          0,
-          existingQueries.length - 19,
-        );
-
-        for (const item of itemsToRemove) {
-          await removeFromSearchHistory(item.id);
-        }
-      }
-    }
+    console.log(`Added "${query}" to search history`);
   } catch (error) {
-    console.error("Failed to add to search history:", error);
+    console.error("Error adding to search history:", error);
   }
 }
 
-// Function to remove a query from search history
+// Function to remove an item from search history
 export async function removeFromSearchHistory(id: string): Promise<void> {
   try {
     const db = await initDB();
 
+    // Check if the store exists
     if (!db.objectStoreNames.contains(SEARCH_HISTORY_STORE)) {
-      console.log("Search history store not found, skipping");
+      console.error(`${SEARCH_HISTORY_STORE} store not found`);
       return;
     }
 
     const tx = db.transaction(SEARCH_HISTORY_STORE, "readwrite");
     const store = tx.objectStore(SEARCH_HISTORY_STORE);
 
+    // Delete the item
+    await store.delete(id);
+
+    // Wait for the transaction to complete
     await new Promise<void>((resolve, reject) => {
-      const request = store.delete(id);
-      request.onsuccess = () => {
-        console.log(`Removed item ${id} from search history`);
-        resolve();
-      };
-      request.onerror = (event) => {
-        console.error("Error removing from search history:", event);
-        reject(event);
-      };
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
     });
+
+    console.log(`Removed item with ID "${id}" from search history`);
   } catch (error) {
-    console.error("Failed to remove from search history:", error);
+    console.error("Error removing from search history:", error);
   }
 }
 
@@ -844,56 +883,100 @@ export async function getAllSearchHistory(): Promise<SearchHistoryItem[]> {
   try {
     const db = await initDB();
 
+    // Check if the store exists
     if (!db.objectStoreNames.contains(SEARCH_HISTORY_STORE)) {
-      console.log("Search history store not found, returning empty array");
+      console.log("Search history store not found");
       return [];
     }
 
     const tx = db.transaction(SEARCH_HISTORY_STORE, "readonly");
     const store = tx.objectStore(SEARCH_HISTORY_STORE);
 
-    const items = await new Promise<SearchHistoryItem[]>((resolve, reject) => {
-      const request = store.getAll();
-      request.onsuccess = () => resolve(request.result || []);
-      request.onerror = (event) => {
-        console.error("Error getting search history:", event);
-        reject(event);
-      };
-    });
+    const history = await new Promise<SearchHistoryItem[]>(
+      (resolve, reject) => {
+        const request = store.getAll();
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = (event) => {
+          console.error("Error getting search history:", event);
+          reject(event);
+        };
+      },
+    );
 
-    // Sort by timestamp, most recent first
-    return items.sort((a, b) => b.timestamp - a.timestamp);
+    // Sort history by timestamp (most recent first)
+    return history.sort((a, b) => b.timestamp - a.timestamp);
   } catch (error) {
     console.error("Failed to get search history:", error);
     return [];
   }
 }
 
-// Function to clear all search history
-export async function clearSearchHistory(): Promise<void> {
+// Function to remove a specific graph log and its associated cached knowledge graph
+export async function removeGraphLog(logId: string): Promise<void> {
   try {
     const db = await initDB();
 
-    if (!db.objectStoreNames.contains(SEARCH_HISTORY_STORE)) {
-      console.log("Search history store not found, skipping");
-      return;
+    // First, get the log to extract the concept
+    if (db.objectStoreNames.contains(GRAPH_LOG_STORE)) {
+      const tx = db.transaction(GRAPH_LOG_STORE, "readonly");
+      const store = tx.objectStore(GRAPH_LOG_STORE);
+
+      const log = await new Promise<GraphLog | undefined>((resolve, reject) => {
+        const request = store.get(logId);
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = (event) => {
+          console.error("Error getting graph log:", event);
+          reject(event);
+        };
+      });
+
+      if (log) {
+        // Now remove the graph log
+        const deleteTx = db.transaction(GRAPH_LOG_STORE, "readwrite");
+        const deleteStore = deleteTx.objectStore(GRAPH_LOG_STORE);
+
+        await new Promise<void>((resolve, reject) => {
+          const request = deleteStore.delete(logId);
+          request.onsuccess = () => {
+            console.log(`Removed graph log for "${log.concept}"`);
+            resolve();
+          };
+          request.onerror = (event) => {
+            console.error("Error removing graph log:", event);
+            reject(event);
+          };
+        });
+
+        // Also remove the cached knowledge graph for this concept
+        if (db.objectStoreNames.contains(GRAPH_STORE)) {
+          const graphId = `graph-${log.concept.toLowerCase().replace(/\s+/g, "-")}`;
+          const graphTx = db.transaction(GRAPH_STORE, "readwrite");
+          const graphStore = graphTx.objectStore(GRAPH_STORE);
+
+          await new Promise<void>((resolve, reject) => {
+            const request = graphStore.delete(graphId);
+            request.onsuccess = () => {
+              console.log(
+                `Removed cached knowledge graph for "${log.concept}"`,
+              );
+              resolve();
+            };
+            request.onerror = (event) => {
+              console.error("Error removing cached knowledge graph:", event);
+              reject(event);
+            };
+          });
+        }
+
+        console.log(
+          `Successfully removed graph log and cached graph for "${log.concept}"`,
+        );
+      } else {
+        console.log(`Graph log with ID ${logId} not found`);
+      }
     }
-
-    const tx = db.transaction(SEARCH_HISTORY_STORE, "readwrite");
-    const store = tx.objectStore(SEARCH_HISTORY_STORE);
-
-    await new Promise<void>((resolve, reject) => {
-      const request = store.clear();
-      request.onsuccess = () => {
-        console.log("Search history cleared");
-        resolve();
-      };
-      request.onerror = (event) => {
-        console.error("Error clearing search history:", event);
-        reject(event);
-      };
-    });
   } catch (error) {
-    console.error("Failed to clear search history:", error);
+    console.error("Failed to remove graph log:", error);
+    throw error;
   }
 }

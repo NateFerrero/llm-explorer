@@ -4,14 +4,22 @@ import { NodeObject } from "./types";
 
 // We no longer need direct API clients as we'll use the util.ts proxy
 
+// Function to sanitize node names by trimming whitespace and removing trailing commas
+export function sanitizeNodeName(name: string): string {
+  // First trim whitespace, then remove any trailing commas
+  return name.trim().replace(/,+$/, "");
+}
+
 // Function to generate a prompt for knowledge graph extraction using LLM
 export function generateKnowledgeGraphPrompt(concept: string): string {
+  // Sanitize the concept name
+  const sanitizedConcept = sanitizeNodeName(concept);
   const nodeCount = 30; // Target number of related concepts
   return `
-    Generate a list of concepts related to "${concept}".
+    Generate a list of concepts related to "${sanitizedConcept}".
     Provide ${nodeCount} related concepts.
     
-    For each concept, provide a score from 0 to 100 indicating the strength of its connection to the main concept "${concept}".
+    For each concept, provide a score from 0 to 100 indicating the strength of its connection to the main concept "${sanitizedConcept}".
     - 100 means the concept is synonymous or extremely closely related.
     - 50 means a moderate, obvious, or default connection.
     - 0 means a very tenuous or barely related connection (if any).
@@ -34,24 +42,28 @@ export function generateNodeContentPrompt(
   mainConcept: string,
   detailLevel: number,
 ): string {
+  // Sanitize the node name/id and mainConcept
+  const sanitizedNodeName = sanitizeNodeName(node.name || node.id);
+  const sanitizedMainConcept = sanitizeNodeName(mainConcept);
+
   let instructions = ``;
   let lengthGuidance = "";
 
   switch (detailLevel) {
     case 1:
-      instructions = `Write a concise, one-paragraph summary (around 50-70 words) about "${node.name || node.id}" in the context of ${mainConcept}. Focus on the core definition and significance.`;
+      instructions = `Write a concise, one-paragraph summary (around 50-70 words) about "${sanitizedNodeName}" in the context of ${sanitizedMainConcept}. Focus on the core definition and significance.`;
       lengthGuidance = "Length: 50-70 words.";
       break;
     case 2:
-      instructions = `Write a short article (around 150-200 words) about "${node.name || node.id}" in the context of ${mainConcept}. Include its definition, significance, and one key aspect or principle.`;
+      instructions = `Write a short article (around 150-200 words) about "${sanitizedNodeName}" in the context of ${sanitizedMainConcept}. Include its definition, significance, and one key aspect or principle.`;
       lengthGuidance = "Length: 150-200 words.";
       break;
     case 3:
-      instructions = `Write a detailed mini-article (around 300-400 words) about "${node.name || node.id}" in the context of ${mainConcept}. Include a comprehensive explanation, its significance, key principles/components, and a real-world example.`;
+      instructions = `Write a detailed mini-article (around 300-400 words) about "${sanitizedNodeName}" in the context of ${sanitizedMainConcept}. Include a comprehensive explanation, its significance, key principles/components, and a real-world example.`;
       lengthGuidance = "Length: 300-400 words.";
       break;
     default: // Level 4 and above
-      instructions = `Write an in-depth article (around 500-700 words, expanding further for levels > 4) about "${node.name || node.id}" in the context of ${mainConcept}. Cover its definition, significance, history (if relevant), key principles/components, multiple real-world applications/examples, current developments, and future directions. Add more depth and examples for higher detail levels (Current level: ${detailLevel}).`;
+      instructions = `Write an in-depth article (around 500-700 words, expanding further for levels > 4) about "${sanitizedNodeName}" in the context of ${sanitizedMainConcept}. Cover its definition, significance, history (if relevant), key principles/components, multiple real-world applications/examples, current developments, and future directions. Add more depth and examples for higher detail levels (Current level: ${detailLevel}).`;
       lengthGuidance = `Length: ${500 + (detailLevel - 4) * 150}-${700 + (detailLevel - 4) * 200} words.`;
       break;
   }
@@ -126,19 +138,35 @@ export async function generateNodeContent(
   mainConcept: string,
   modelId: string,
   detailLevel: number = 1,
+  skipCache: boolean = false,
   useCache: boolean = true,
 ): Promise<string> {
   try {
-    // Try to load from cache first if useCache is true
-    if (useCache && typeof window !== "undefined") {
+    // Sanitize node name/id and mainConcept
+    const sanitizedNodeId = sanitizeNodeName(node.id);
+    const sanitizedNodeName = sanitizeNodeName(node.name || node.id);
+    const sanitizedMainConcept = sanitizeNodeName(mainConcept);
+
+    // Create a sanitized node object
+    const sanitizedNode: NodeObject = {
+      ...node,
+      id: sanitizedNodeId,
+      name: sanitizedNodeName,
+    };
+
+    // Skip cache if skipCache is true, otherwise check useCache
+    const shouldUseCache = !skipCache && useCache;
+
+    // Try to load from cache first if we should use cache
+    if (shouldUseCache && typeof window !== "undefined") {
       try {
         const cachedContent = await getCachedArticle(
-          `article-${node.id}-${detailLevel}-${modelId}`,
+          `article-${sanitizedNodeId}-${detailLevel}-${modelId}`,
         );
 
         if (cachedContent && cachedContent.content) {
           console.log(
-            `Using cached article for "${node.name || node.id}" at detail level ${detailLevel}`,
+            `Using cached article for "${sanitizedNodeName}" at detail level ${detailLevel}`,
           );
           return cachedContent.content;
         }
@@ -148,7 +176,11 @@ export async function generateNodeContent(
       }
     }
 
-    const prompt = generateNodeContentPrompt(node, mainConcept, detailLevel);
+    const prompt = generateNodeContentPrompt(
+      sanitizedNode,
+      sanitizedMainConcept,
+      detailLevel,
+    );
     const result = await queryLLM(prompt, modelId);
 
     if (!result.success || !result.data) {
@@ -163,13 +195,14 @@ export async function generateNodeContent(
     if (typeof window !== "undefined") {
       try {
         await cacheArticle({
-          id: `article-${node.id}-${detailLevel}-${modelId}`,
-          nodeId: node.id,
-          concept: mainConcept,
-          title: node.name || node.id,
+          id: `article-${sanitizedNodeId}-${detailLevel}-${modelId}`,
+          nodeId: sanitizedNodeId,
+          concept: sanitizedMainConcept,
+          title: sanitizedNodeName,
           content: content,
           detailLevel: detailLevel,
           timestamp: Date.now(),
+          mainConcept: sanitizedMainConcept,
         });
       } catch (error) {
         console.error("Error caching article:", error);

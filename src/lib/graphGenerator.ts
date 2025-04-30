@@ -22,22 +22,49 @@ function getColorForScore(score: number): string {
   }
 }
 
+// Function to sanitize node names by trimming whitespace and removing trailing commas
+function sanitizeNodeName(name: string): string {
+  // First trim whitespace, then remove any trailing commas
+  return name.trim().replace(/,+$/, "");
+}
+
 export async function generateKnowledgeGraph(
   concept: string,
   modelId: string,
+  skipCache: boolean = false,
   useCache: boolean = true,
 ): Promise<GraphData> {
+  // Sanitize the main concept
+  const sanitizedConcept = sanitizeNodeName(concept);
+
   console.log(
-    `Generating knowledge graph for "${concept}" using model ${modelId}`,
+    `Generating knowledge graph for "${sanitizedConcept}" using model ${modelId}`,
   );
 
-  // Try to load from cache first if useCache is true
-  if (useCache && typeof window !== "undefined") {
+  // Skip cache if skipCache is true, otherwise check useCache
+  const shouldUseCache = !skipCache && useCache;
+
+  // Try to load from cache first if we should use cache
+  if (shouldUseCache && typeof window !== "undefined") {
     try {
-      const cachedGraph = await getCachedKnowledgeGraph(concept);
+      const cachedGraph = await getCachedKnowledgeGraph(sanitizedConcept);
       if (cachedGraph) {
-        console.log(`Using cached knowledge graph for "${concept}"`);
-        return cachedGraph;
+        console.log(`Using cached knowledge graph for "${sanitizedConcept}"`);
+
+        // Ensure no residual positioning info is kept from previous visualizations
+        // by creating a clean copy of the graph with initial positions reset
+        const cleanGraph: GraphData = {
+          nodes: cachedGraph.nodes.map((node) => ({
+            ...node,
+            x: undefined,
+            y: undefined,
+            vx: undefined,
+            vy: undefined,
+          })),
+          links: cachedGraph.links.map((link) => ({ ...link })),
+        };
+
+        return cleanGraph;
       }
     } catch (error) {
       console.error("Error accessing cache:", error);
@@ -50,17 +77,17 @@ export async function generateKnowledgeGraph(
 
   // Add the main concept node
   const mainConceptNode: NodeObject = {
-    id: concept,
-    name: concept,
+    id: sanitizedConcept,
+    name: sanitizedConcept,
     val: 50, // Give main concept a decent default size value
     color: "#e91e63", // Keep main concept distinct (Pink)
-    description: `Main concept: ${concept}`,
+    description: `Main concept: ${sanitizedConcept}`,
   };
   nodes.push(mainConceptNode);
 
   try {
     // 1. Generate the prompt
-    const prompt = generateKnowledgeGraphPrompt(concept);
+    const prompt = generateKnowledgeGraphPrompt(sanitizedConcept);
 
     // 2. Query the LLM
     const response = await queryLLM(prompt, modelId);
@@ -88,7 +115,11 @@ export async function generateKnowledgeGraph(
         }
 
         const scoreStr = parts[0].trim();
-        const conceptName = parts.slice(1).join(",").trim(); // Join back in case concept name had commas
+        let conceptName = parts.slice(1).join(","); // Join back in case concept name had commas
+
+        // Sanitize the concept name to remove trailing commas and whitespace
+        conceptName = sanitizeNodeName(conceptName);
+
         const score = parseInt(scoreStr, 10);
 
         if (isNaN(score) || score < 0 || score > 100) {
@@ -113,11 +144,11 @@ export async function generateKnowledgeGraph(
 
         // Create node
         const newNode: NodeObject = {
-          id: conceptName, // Use concept name as ID
+          id: conceptName, // Use sanitized concept name as ID
           name: conceptName,
           val: score, // Use score for node size value
           color: getColorForScore(score), // Set color based on score
-          description: `Related concept to ${concept} (Score: ${score})`,
+          description: `Related concept to ${sanitizedConcept} (Score: ${score})`,
         };
         nodes.push(newNode);
 
@@ -135,7 +166,7 @@ export async function generateKnowledgeGraph(
     });
   } catch (error) {
     console.error(
-      `Failed to generate or parse knowledge graph from LLM for concept "${concept}":`,
+      `Failed to generate or parse knowledge graph from LLM for concept "${sanitizedConcept}":`,
       error,
     );
     // Return a minimal graph with just the main node and an error description
@@ -149,7 +180,7 @@ export async function generateKnowledgeGraph(
   // Cache the generated graph
   if (typeof window !== "undefined") {
     try {
-      await cacheKnowledgeGraph(concept, graphData);
+      await cacheKnowledgeGraph(sanitizedConcept, graphData);
     } catch (error) {
       console.error("Error caching knowledge graph:", error);
     }

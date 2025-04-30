@@ -4,6 +4,7 @@ import { generateNodeContent } from "@/lib/api-clients";
 import { generateKnowledgeGraph } from "@/lib/graphGenerator";
 import {
   addToSearchHistory as addToSearchHistoryDB,
+  BookmarkedArticle,
   cacheArticle,
   cacheKnowledgeGraph,
   getAllBookmarks,
@@ -12,7 +13,9 @@ import {
   getCachedKnowledgeGraph,
   GraphLog,
   logGraphAccess,
+  removeBookmark,
   removeFromSearchHistory as removeFromSearchHistoryDB,
+  removeGraphLog,
   SearchHistoryItem,
   updateGraphBookmarkCount,
 } from "@/lib/indexeddb";
@@ -31,10 +34,12 @@ import {
   Lock,
   LogOut,
   Maximize,
+  MoreVertical,
   MousePointer,
   RefreshCw,
   Search,
   Share2,
+  Trash2,
   Unlock,
   X,
   ZoomIn,
@@ -44,6 +49,7 @@ import dynamic from "next/dynamic";
 import { useRouter, useSearchParams } from "next/navigation";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useAFrame } from "./AFrameWrapper";
+import HelpCenter from "./HelpCenter";
 import KeyboardShortcuts from "./KeyboardShortcuts";
 import ModelSwitcher from "./ModelSwitcher";
 import NodeDetail from "./NodeDetail";
@@ -67,7 +73,7 @@ const KnowledgeExplorer: React.FC = () => {
 
   // Get A-Frame context and handle loading state
   const { isAFrameLoaded, aframeInstance } = useAFrame();
-  const [sidebarWidth, setSidebarWidth] = useState(DEFAULT_SIDEBAR_WIDTH);
+  const [sidebarWidth, setSidebarWidth] = useState(360);
   const [isResizing, setIsResizing] = useState(false);
   const resizeRef = useRef<HTMLDivElement>(null);
 
@@ -91,6 +97,8 @@ const KnowledgeExplorer: React.FC = () => {
 
   const [searchQuery, setSearchQuery] = useState<string>("");
   const [inputValue, setInputValue] = useState<string>(""); // New state for input field
+  const [pendingSearchQuery, setPendingSearchQuery] = useState<string>(""); // Track pending navigation query
+  const [visualInputValue, setVisualInputValue] = useState<string>(""); // Visual representation of input
   const [searchHistory, setSearchHistory] = useState<SearchHistoryItem[]>([]);
   const [showSearchHistory, setShowSearchHistory] = useState<boolean>(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
@@ -143,6 +151,14 @@ const KnowledgeExplorer: React.FC = () => {
   const [graphLogsLoading, setGraphLogsLoading] = useState(false);
   // Add a ref to track processed URL states
   const processedUrlStatesRef = useRef<Set<string>>(new Set());
+
+  // State for showing dropdown menus
+  const [activeBookmarkMenu, setActiveBookmarkMenu] = useState<string | null>(
+    null,
+  );
+  const [activeGraphLogMenu, setActiveGraphLogMenu] = useState<string | null>(
+    null,
+  );
 
   // Mouse event handlers for resizing
   const handleMouseDown = (e: React.MouseEvent) => {
@@ -227,6 +243,11 @@ const KnowledgeExplorer: React.FC = () => {
     loadSearchHistory();
   }, [loadSearchHistory]);
 
+  // Load graph logs when component mounts
+  useEffect(() => {
+    loadGraphLogs();
+  }, []);
+
   // Add to search history using IndexedDB
   const addToSearchHistory = async (query: string) => {
     if (!query.trim()) return;
@@ -272,6 +293,29 @@ const KnowledgeExplorer: React.FC = () => {
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, []);
 
+  // Close dropdown menus when clicking outside
+  useEffect(() => {
+    const handleClickOutsideMenus = (e: MouseEvent) => {
+      // Check if clicking outside any open menu
+      if (activeBookmarkMenu !== null || activeGraphLogMenu !== null) {
+        // If the clicked element is not a menu button or inside a menu
+        const isMenuButton = (e.target as Element)?.closest(
+          '[aria-label="Bookmark options"], [aria-label="Graph log options"]',
+        );
+        const isInsideMenu = (e.target as Element)?.closest(".absolute");
+
+        if (!isMenuButton && !isInsideMenu) {
+          setActiveBookmarkMenu(null);
+          setActiveGraphLogMenu(null);
+        }
+      }
+    };
+
+    document.addEventListener("mousedown", handleClickOutsideMenus);
+    return () =>
+      document.removeEventListener("mousedown", handleClickOutsideMenus);
+  }, [activeBookmarkMenu, activeGraphLogMenu]);
+
   const handleExploreNode = async (node: NodeObject) => {
     const nodeName = node.name || node.id;
     console.log(`Exploring node ${nodeName} as main concept`);
@@ -279,11 +323,22 @@ const KnowledgeExplorer: React.FC = () => {
     // Set the search query to the node name or ID
     setSearchQuery(nodeName);
     setInputValue(nodeName);
+    setVisualInputValue(nodeName); // Update visual input for immediate feedback
+    // Set pending search query to show the navigation is in progress
+    setPendingSearchQuery(nodeName);
 
-    // Clear the selected node and content
+    // Clear ALL previous state to ensure a fresh start with no context contamination
     setSelectedNode(null);
     setSummaryText("");
     setSummaryLoading(false);
+    setDetailLevel(1); // Reset detail level
+    setHighlightNodes(new Set()); // Clear highlighted nodes
+
+    // Reset graph layout state
+    setZoomLevel(1);
+    setInteractionMode("select");
+    setIsGraphLocked(false);
+    setCenterFocusedNode(true);
 
     // Switch to the explore tab
     handleTabChange("explore");
@@ -293,93 +348,106 @@ const KnowledgeExplorer: React.FC = () => {
     processedUrlStatesRef.current.add(urlStateKey);
 
     // Update URL to reflect we're viewing this node as a main concept
-    // Explicitly clear the node parameter
+    // Explicitly clear the node parameter and any other parameters
     updateUrlParams({
       q: nodeName,
       node: undefined, // Clear the node parameter as we're viewing it as a main concept
+      detailLevel: undefined, // Clear detail level
     });
 
     // Set loading state
     setIsLoading(true);
+    setError("");
 
     try {
-      // First check if we have a cached graph for this node
-      let cachedGraph = await getCachedKnowledgeGraph(nodeName);
+      // Clear existing graph data first to prevent any context bleed
+      setGraphData({ nodes: [], links: [] });
 
-      if (cachedGraph) {
-        console.log(`Loaded cached graph for ${nodeName}`);
-        setGraphData(cachedGraph);
-      } else {
-        console.log(`Generating new knowledge graph for ${nodeName}`);
-        // Generate a new knowledge graph for this node
-        const result = await generateKnowledgeGraph(nodeName, selectedModel.id);
-        setGraphData(result);
+      // Always generate a new graph for the main concept view to avoid context contamination
+      // Skip cache to ensure a fresh graph generation
+      console.log(
+        `Generating fresh knowledge graph for "${nodeName}" as main concept`,
+      );
+      const result = await generateKnowledgeGraph(
+        nodeName,
+        selectedModel.id,
+        true, // skipCache = true to force regeneration
+      ); // Force skip cache
+      setGraphData(result);
 
-        // Cache the newly generated graph
-        await cacheKnowledgeGraph(nodeName, result);
-      }
+      // Cache the newly generated graph for future use
+      await cacheKnowledgeGraph(nodeName, result);
 
-      // Log this access to the graph
+      // Log the graph access
       await logGraphAccess(nodeName);
 
-      // Find the main node in the graph data (should be the first node)
-      const mainNode =
-        cachedGraph?.nodes.find((n) => n.id === nodeName) ||
-        graphData.nodes.find((n) => n.id === nodeName);
-
+      // After graph is loaded, find the main node that represents this concept
+      // and generate fresh content for it
+      const mainNode = result.nodes.find((n) => n.id === nodeName);
       if (mainNode) {
-        // Create a copy with the isMainEntry flag
-        const mainEntryNode = {
-          ...mainNode,
-          isMainEntry: true,
-          mainConcept: nodeName,
-        };
-
-        // Set as selected node
-        setSelectedNode(mainEntryNode);
-        setSummaryLoading(true);
-
-        // Generate content for this node as a main concept
-        try {
-          const content = await generateNodeContent(
-            mainEntryNode,
-            nodeName, // The context is now this node itself
-            selectedModel.id,
-            1, // Start with detail level 1
-          );
-
-          // Update content
-          updateNodeWithContent(mainEntryNode, content);
-
-          // Cache this content
-          await cacheArticle({
-            id: `article-${nodeName}-1-${selectedModel.id}-${nodeName}`,
-            nodeId: nodeName,
-            concept: nodeName,
-            title: mainNode.name || mainNode.id,
-            content: content,
-            detailLevel: 1,
-            timestamp: Date.now(),
+        // Wait for graph to be fully loaded before selecting node
+        setTimeout(() => {
+          // Create a new node object with isMainEntry flag to indicate this is shown as a main concept
+          const mainEntryNode = {
+            ...mainNode,
+            isMainEntry: true,
+            // Explicitly avoid any mainConcept other than itself to prevent context contamination
             mainConcept: nodeName,
-          });
-        } catch (error) {
-          console.error("Error generating content for main entry:", error);
-          updateNodeWithContent(
+          };
+
+          // Set as selected node
+          setSelectedNode(mainEntryNode);
+          setSummaryLoading(true);
+
+          // Generate fresh content for this node as a main concept
+          // Skip cache to ensure we're not getting context-contaminated content
+          generateNodeContent(
             mainEntryNode,
-            generateFallbackContent(mainEntryNode, nodeName),
-          );
-        }
-      } else {
-        console.error(`Could not find main node for ${nodeName} in graph data`);
+            nodeName,
+            selectedModel.id,
+            1,
+            true,
+          )
+            .then((content) => {
+              // Update content
+              updateNodeWithContent(mainEntryNode, content);
+
+              // Cache the fresh content for future use
+              cacheArticle({
+                id: `article-${nodeName}-1-${selectedModel.id}-${nodeName}-main`,
+                nodeId: nodeName,
+                concept: nodeName,
+                title: mainNode.name || mainNode.id,
+                content: content,
+                detailLevel: 1,
+                timestamp: Date.now(),
+                mainConcept: nodeName, // Self-referential - concept is about itself
+                isMainEntry: true, // Flag that this is cached as a main entry
+              }).catch((e) =>
+                console.error("Error caching main entry content:", e),
+              );
+            })
+            .catch((error) => {
+              console.error("Error generating main entry content:", error);
+              updateNodeWithContent(
+                mainEntryNode,
+                generateFallbackContent(mainEntryNode, nodeName),
+              );
+            });
+        }, 500);
       }
 
-      // Apply a single reheat after loading
+      // Reheat the force simulation to improve layout
       setTimeout(reheatForceSimulation, 300);
     } catch (error) {
-      console.error(`Error exploring node ${nodeName} as main concept:`, error);
-      setError(`Failed to explore ${nodeName}: ${error}`);
+      console.error(`Error exploring node "${nodeName}":`, error);
+      setError(
+        `Failed to explore "${nodeName}": ${error instanceof Error ? error.message : String(error)}`,
+      );
     } finally {
       setIsLoading(false);
+      // Clear the pending search query
+      setPendingSearchQuery("");
     }
   };
 
@@ -448,7 +516,7 @@ const KnowledgeExplorer: React.FC = () => {
     }
   }, [graphData.nodes.length]);
 
-  // Update handleSearch function with the skipCache parameter
+  // Update handleSearch function to manage visual state
   const handleSearch = async (
     query: string = inputValue,
     skipTabChange: boolean = false,
@@ -459,6 +527,10 @@ const KnowledgeExplorer: React.FC = () => {
     // Set loading state
     setIsLoading(true);
     setError("");
+    // Set pending search query to show in the input
+    setPendingSearchQuery(query);
+    // Always update visual input value first for immediate feedback
+    setVisualInputValue(query);
 
     // Clear the selected node and content when changing to a new concept
     if (query !== searchQuery) {
@@ -471,48 +543,59 @@ const KnowledgeExplorer: React.FC = () => {
     await addToSearchHistory(query);
 
     // Create a URL state key and mark it as processed to prevent infinite loops
-    const urlStateKey = `${query}-null-${activeTab}`;
+    const urlStateKey = `${query}-null-explore`;
     processedUrlStatesRef.current.add(urlStateKey);
 
-    // Update URL parameters - explicitly clear node parameter when changing concepts
+    // Update URL
     updateUrlParams({
       q: query,
-      node: undefined, // Clear the node parameter when searching for a new concept
+      node: undefined, // Clear any node selection
     });
 
-    // Switch to the 'explore' tab if not already there and not skipping tab change
-    if (activeTab !== "explore" && !skipTabChange) {
-      handleTabChange("explore");
-    }
-
     try {
-      let cachedGraph = skipCache ? null : await getCachedKnowledgeGraph(query);
+      let graphToUse = null;
 
-      if (cachedGraph) {
-        console.log(`Loaded cached graph for ${query}`);
-        setGraphData(cachedGraph);
+      // First check if we have a cached graph for this concept, unless skipCache is true
+      if (!skipCache) {
+        graphToUse = await getCachedKnowledgeGraph(query);
+      }
+
+      if (graphToUse) {
+        console.log(`Using cached knowledge graph for "${query}"`);
+        setGraphData(graphToUse);
       } else {
-        // If no cached graph, generate a new one
-        console.log(`No cached graph for ${query}, generating new one`);
+        // Generate a new knowledge graph using the LLM
+        console.log(`Generating new knowledge graph for "${query}"`);
         const result = await generateKnowledgeGraph(query, selectedModel.id);
         setGraphData(result);
 
-        // Cache the newly generated graph
+        // Cache the generated graph for future use
         await cacheKnowledgeGraph(query, result);
       }
 
-      setSearchQuery(query);
-
-      // Log graph access
+      // Log this search/graph access
       await logGraphAccess(query);
 
-      // Just use a single reheat with a slight delay
+      // Also update the graph logs if the log tab is active
+      if (activeTab === "log") {
+        await loadGraphLogs();
+      }
+
+      // Switch to the explore tab if not skipping tab change
+      if (!skipTabChange) {
+        handleTabChange("explore");
+      }
+
+      // Apply a single reheat after loading
       setTimeout(reheatForceSimulation, 300);
-    } catch (err) {
-      console.error("Error generating knowledge graph:", err);
-      setError("Failed to generate knowledge graph. Please try again.");
+    } catch (error) {
+      console.error(`Error searching for "${query}":`, error);
+      setError(
+        `Failed to search for "${query}": ${error instanceof Error ? error.message : String(error)}`,
+      );
     } finally {
       setIsLoading(false);
+      setPendingSearchQuery(""); // Clear pending search query when done
     }
   };
 
@@ -828,6 +911,55 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
     }
   };
 
+  // Handle removing a bookmark
+  const handleRemoveBookmark = async (
+    bookmark: BookmarkedArticle,
+    e: React.MouseEvent,
+  ) => {
+    e.stopPropagation(); // Prevent triggering the bookmark click
+
+    try {
+      await removeBookmark(bookmark.id);
+      console.log(`Removed bookmark: ${bookmark.title}`);
+
+      // Refresh the bookmarks list
+      await loadBookmarks();
+
+      // Also update bookmark counts in graph logs if the bookmark had a mainConcept
+      if (bookmark.mainConcept) {
+        await updateGraphBookmarkCount(bookmark.mainConcept);
+
+        // Refresh graph logs if we're on that tab
+        if (activeTab === "log") {
+          await loadGraphLogs();
+        }
+      }
+
+      // Close any open menus
+      setActiveBookmarkMenu(null);
+    } catch (error) {
+      console.error("Error removing bookmark:", error);
+    }
+  };
+
+  // Handle removing a graph log and its cached graph
+  const handleRemoveGraphLog = async (log: GraphLog, e: React.MouseEvent) => {
+    e.stopPropagation(); // Prevent triggering any parent click handlers
+
+    try {
+      await removeGraphLog(log.id);
+      console.log(`Removed graph log and cached graph for: ${log.concept}`);
+
+      // Refresh the graph logs list
+      await loadGraphLogs();
+
+      // Close any open menus
+      setActiveGraphLogMenu(null);
+    } catch (error) {
+      console.error("Error removing graph log:", error);
+    }
+  };
+
   // Handle bookmark change in NodeDetail
   const handleBookmarkToggle = async (
     isBookmarked: boolean,
@@ -875,6 +1007,9 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
     if (bookmark.mainConcept && bookmark.mainConcept !== searchQuery) {
       setIsLoading(true);
       setSearchQuery(bookmark.mainConcept);
+      // Set input value and pending search query for visual feedback
+      setInputValue(bookmark.mainConcept);
+      setPendingSearchQuery(bookmark.mainConcept);
 
       try {
         // Try to get the cached graph for this concept
@@ -936,6 +1071,8 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
         );
       } finally {
         setIsLoading(false);
+        // Clear the pending search query when done
+        setPendingSearchQuery("");
       }
     } else {
       // Even if we're using the same graph, we should update URL params to ensure the node is reflected
@@ -1275,8 +1412,9 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
     return () => window.removeEventListener("popstate", handlePopState);
   }, []);
 
-  // URL params handling
+  // Effect to handle loading from URL parameters
   useEffect(() => {
+    // Define loading from URL parameters
     const loadFromUrlParams = async () => {
       // Only run in browser environment
       if (typeof window === "undefined") return;
@@ -1287,28 +1425,15 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
       const nodeParam = urlParams.get("node");
       const tabParam = urlParams.get("explorerTab");
 
-      // Create a unique key for this URL state
-      const urlStateKey = `${queryParam || ""}-${nodeParam || ""}-${tabParam || ""}`;
-
-      // Skip if we've already processed this exact URL state to prevent infinite loops
-      if (processedUrlStatesRef.current.has(urlStateKey)) {
-        return;
-      }
-
-      // Mark this URL state as processed
-      processedUrlStatesRef.current.add(urlStateKey);
-
-      // Set correct tab first (this won't trigger a re-render if tab is the same)
+      // Set correct tab first
       if (
         tabParam === "explore" ||
         tabParam === "bookmarks" ||
         tabParam === "log"
       ) {
-        // Use our improved handleTabChange to avoid unnecessary updates
         if (tabParam !== activeTab) {
-          setActiveTab(tabParam);
+          setActiveTab(tabParam as "explore" | "bookmarks" | "log");
 
-          // Use a type-safe approach to check if we're not on the explore tab
           const currentTab = tabParam as "explore" | "bookmarks" | "log";
           if (currentTab === "bookmarks" || currentTab === "log") {
             setSelectedNode(null);
@@ -1352,6 +1477,8 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
       setSearchQuery(queryParam);
       // Also update the input value when loading from URL
       setInputValue(queryParam);
+      // Set pending search query for visual feedback during loading
+      setPendingSearchQuery(queryParam);
 
       // Only show loading indicator if we don't have graph data already
       if (graphData.nodes.length === 0) {
@@ -1492,6 +1619,8 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
         setError(`Failed to load content from URL: ${error}`);
       } finally {
         setIsLoading(false);
+        // Clear the pending search query
+        setPendingSearchQuery("");
       }
     };
 
@@ -1536,7 +1665,7 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
           tabParam === "log"
         ) {
           if (tabParam !== activeTab) {
-            setActiveTab(tabParam);
+            setActiveTab(tabParam as "explore" | "bookmarks" | "log");
 
             const currentTab = tabParam as "explore" | "bookmarks" | "log";
             if (currentTab === "bookmarks" || currentTab === "log") {
@@ -1568,6 +1697,8 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
           setSearchQuery(queryParam);
           // Also update the input value for consistency when navigating
           setInputValue(queryParam);
+          // Set pending search query for visual feedback during navigation
+          setPendingSearchQuery(queryParam);
 
           // Clear selected node when changing to a new concept if there's no node param
           if (!nodeParam) {
@@ -1592,9 +1723,19 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
               handleNodeClick(node);
             }
           }
+          // Clear pending search query when we're done
+          setPendingSearchQuery("");
         } else if (isNewConcept && graphData.nodes.length === 0) {
           // If changing to a new concept and we don't have graph data, trigger a search
-          handleSearch(queryParam, false, false);
+          try {
+            await handleSearch(queryParam, false, false);
+          } finally {
+            // Make sure pending search query is cleared even if there's an error
+            setPendingSearchQuery("");
+          }
+        } else {
+          // Clear pending search query for any other cases
+          setPendingSearchQuery("");
         }
       };
 
@@ -1715,35 +1856,66 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
         onToggleLock={toggleGraphLock}
         onToggleHelp={toggleHelp}
       />
+
+      {/* Help Center */}
+      {showHelp && <HelpCenter onClose={() => setShowHelp(false)} />}
+
       {/* Search and Controls */}
       <div className="flex flex-col gap-3 p-4 pb-2 md:flex-row md:items-center">
         <div className="relative flex-grow">
           <div className="pointer-events-none absolute inset-y-0 left-0 flex items-center pl-3">
-            <Search size={18} className="text-slate-400" />
+            <Search
+              size={18}
+              className={
+                pendingSearchQuery ? "text-green-300" : "text-slate-400"
+              }
+            />
           </div>
           <input
             ref={searchInputRef}
             type="text"
-            value={inputValue}
-            onChange={(e) => setInputValue(e.target.value)}
+            value={pendingSearchQuery || visualInputValue || inputValue}
+            onChange={(e) => {
+              if (!pendingSearchQuery) {
+                // Only allow changing if not in pending state
+                setInputValue(e.target.value);
+                setVisualInputValue(e.target.value); // Keep visual state in sync
+              }
+            }}
             onClick={() => {
-              loadSearchHistory();
-              setShowSearchHistory(true);
+              if (!pendingSearchQuery) {
+                // Don't show history during pending state
+                loadSearchHistory();
+                setShowSearchHistory(true);
+              }
             }}
             placeholder="Enter a concept to explore (e.g., quantum physics, machine learning)"
-            className="w-full rounded-md border border-slate-600 bg-slate-700 py-2 pl-10 pr-4 focus:outline-none focus:ring-2 focus:ring-blue-500"
+            className={`w-full rounded-md border py-2 pl-10 pr-4 focus:outline-none focus:ring-2 focus:ring-blue-500 ${
+              pendingSearchQuery
+                ? "border-green-500 bg-green-900/20 text-green-100"
+                : "border-slate-600 bg-slate-700"
+            }`}
             onKeyDown={async (e) => {
-              if (e.key === "Enter") {
+              if (e.key === "Enter" && !pendingSearchQuery) {
+                // Prevent double submission
                 e.preventDefault();
                 try {
+                  // First, immediately update the visual input for instant feedback
+                  setVisualInputValue(inputValue);
+
+                  // Then close the dropdown - the visual state will ensure the value doesn't flash
+                  setShowSearchHistory(false);
+
+                  // Set the pending search query for styling
+                  setPendingSearchQuery(inputValue);
+
                   // Update searchQuery from input when submitting
                   setSearchQuery(inputValue);
                   await handleSearch(inputValue);
                 } catch (err) {
                   console.error("Error executing search:", err);
+                  setPendingSearchQuery(""); // Clear pending state on error
                 }
-                // Close the dropdown after the search is completed
-                setShowSearchHistory(false);
               }
             }}
           />
@@ -1759,15 +1931,21 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
                     onClick={async () => {
                       // Set both input value and search query
                       setInputValue(item.query);
+                      // Immediately update visual input value
+                      setVisualInputValue(item.query);
+                      // Close dropdown first - visual state prevents flashing
+                      setShowSearchHistory(false);
+                      // Set pending state
+                      setPendingSearchQuery(item.query);
+
                       setSearchQuery(item.query);
                       // Execute the search
                       try {
                         await handleSearch(item.query);
                       } catch (err) {
                         console.error("Error executing search:", err);
+                        setPendingSearchQuery("");
                       }
-                      // Close the dropdown after the search is complete
-                      setShowSearchHistory(false);
                     }}
                   >
                     <span className="truncate">{item.query}</span>
@@ -1790,18 +1968,29 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
         <div className="flex gap-2">
           <button
             onClick={async () => {
+              if (pendingSearchQuery) return; // Prevent double submission
               try {
+                // Immediately update visual input for instant feedback
+                setVisualInputValue(inputValue);
+                // Close dropdown first - visual state prevents flashing
+                setShowSearchHistory(false);
+                // Set the pending search query for styling
+                setPendingSearchQuery(inputValue);
+
                 // Update searchQuery from input when clicking button
                 setSearchQuery(inputValue);
                 await handleSearch(inputValue);
-                // Close the dropdown after the search is completed
-                setShowSearchHistory(false);
               } catch (err) {
                 console.error("Error executing search:", err);
+                setPendingSearchQuery(""); // Clear pending state on error
               }
             }}
-            disabled={isLoading || !inputValue.trim()}
-            className={`rounded-md px-5 py-2 font-medium transition-colors ${isLoading || !inputValue.trim() ? "cursor-not-allowed bg-slate-600 text-slate-300" : "bg-blue-600 text-white hover:bg-blue-700"}`}
+            disabled={isLoading || !inputValue.trim() || !!pendingSearchQuery}
+            className={`rounded-md px-5 py-2 font-medium transition-colors ${
+              isLoading || !inputValue.trim() || pendingSearchQuery
+                ? "cursor-not-allowed bg-slate-600 text-slate-300"
+                : "bg-blue-600 text-white hover:bg-blue-700"
+            }`}
           >
             {isLoading ? "Loading..." : "Explore"}
           </button>
@@ -2321,7 +2510,7 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
                             size={18}
                             className="mr-2 mt-1 flex-shrink-0 fill-yellow-400 text-yellow-400"
                           />
-                          <div>
+                          <div className="flex-1">
                             <h3 className="font-medium text-white">
                               {bookmark.title}
                             </h3>
@@ -2356,6 +2545,36 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
                                 Copy link
                               </button>
                             </div>
+                          </div>
+                          <div className="relative ml-2">
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation(); // Prevent bookmark click
+                                setActiveBookmarkMenu(
+                                  activeBookmarkMenu === bookmark.id
+                                    ? null
+                                    : bookmark.id,
+                                );
+                              }}
+                              className="flex h-8 w-8 items-center justify-center rounded-full text-slate-400 hover:bg-slate-600 hover:text-white"
+                              aria-label="Bookmark options"
+                            >
+                              <MoreVertical size={16} />
+                            </button>
+
+                            {activeBookmarkMenu === bookmark.id && (
+                              <div className="absolute right-0 top-8 z-10 min-w-[150px] rounded-md border border-slate-700 bg-slate-800 py-1 shadow-lg">
+                                <button
+                                  onClick={(e) =>
+                                    handleRemoveBookmark(bookmark, e)
+                                  }
+                                  className="flex w-full items-center px-4 py-2 text-left text-sm text-red-400 hover:bg-slate-700"
+                                >
+                                  <Trash2 size={14} className="mr-2" />
+                                  Remove bookmark
+                                </button>
+                              </div>
+                            )}
                           </div>
                         </div>
                       </button>
@@ -2429,6 +2648,32 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
                                 Load Graph
                               </button>
                             </div>
+                          </div>
+                          <div className="relative ml-2">
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setActiveGraphLogMenu(
+                                  activeGraphLogMenu === log.id ? null : log.id,
+                                );
+                              }}
+                              className="flex h-8 w-8 items-center justify-center rounded-full text-slate-400 hover:bg-slate-600 hover:text-white"
+                              aria-label="Graph log options"
+                            >
+                              <MoreVertical size={16} />
+                            </button>
+
+                            {activeGraphLogMenu === log.id && (
+                              <div className="absolute right-0 top-8 z-10 min-w-[150px] rounded-md border border-slate-700 bg-slate-800 py-1 shadow-lg">
+                                <button
+                                  onClick={(e) => handleRemoveGraphLog(log, e)}
+                                  className="flex w-full items-center px-4 py-2 text-left text-sm text-red-400 hover:bg-slate-700"
+                                >
+                                  <Trash2 size={14} className="mr-2" />
+                                  Remove graph
+                                </button>
+                              </div>
+                            )}
                           </div>
                         </div>
                       </div>
