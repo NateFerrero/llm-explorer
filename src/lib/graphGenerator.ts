@@ -1,4 +1,4 @@
-import { generateKnowledgeGraphPrompt, queryLLM } from "./api-clients";
+import { generateCombinedKnowledgeGraph } from "./api-clients";
 import { cacheKnowledgeGraph, getCachedKnowledgeGraph } from "./indexeddb";
 import { GraphData, LinkObject, NodeObject } from "./types";
 
@@ -23,9 +23,13 @@ function getColorForScore(score: number): string {
 }
 
 // Function to sanitize node names by trimming whitespace and removing trailing commas
-function sanitizeNodeName(name: string): string {
-  // First trim whitespace, then remove any trailing commas
-  return name.trim().replace(/,+$/, "");
+export function sanitizeNodeName(name: string): string {
+  if (!name) return "";
+  // First trim whitespace, then remove any trailing commas, then trim again in case there was whitespace after commas
+  return name
+    .trim()
+    .replace(/,+\s*$/, "")
+    .trim();
 }
 
 export async function generateKnowledgeGraph(
@@ -86,84 +90,88 @@ export async function generateKnowledgeGraph(
   nodes.push(mainConceptNode);
 
   try {
-    // 1. Generate the prompt
-    const prompt = generateKnowledgeGraphPrompt(sanitizedConcept);
+    // NEW APPROACH: Use the combined method to get results from both prompt types
+    const combinedResults = await generateCombinedKnowledgeGraph(
+      sanitizedConcept,
+      modelId,
+    );
 
-    // 2. Query the LLM
-    const response = await queryLLM(prompt, modelId);
-
-    if (!response.success || !response.data) {
+    if (combinedResults.length === 0) {
       throw new Error(
-        response.error || "LLM query failed with no specific error message.",
+        "Failed to generate knowledge graph: No results from either prompt type",
       );
     }
 
-    // 3. Parse the LLM response
-    const lines = response.data
-      .split("\n")
-      .filter((line: string) => line.trim() !== "");
-    console.log(
-      `Received ${lines.length} lines from LLM for graph generation.`,
-    );
+    // Process each result set (list and concept results)
+    for (const responseData of combinedResults) {
+      const lines = responseData
+        .split("\n")
+        .filter((line: string) => line.trim() !== "");
 
-    lines.forEach((line: string, index: number) => {
-      try {
-        const parts = line.split(",");
-        if (parts.length < 2) {
-          console.warn(`Skipping malformed line (no comma): ${line}`);
-          return; // Skip this line
-        }
+      console.log(`Processing ${lines.length} lines from a result set`);
 
-        const scoreStr = parts[0].trim();
-        let conceptName = parts.slice(1).join(","); // Join back in case concept name had commas
+      lines.forEach((line: string, index: number) => {
+        try {
+          const parts = line.split(",");
+          if (parts.length < 2) {
+            console.warn(`Skipping malformed line (no comma): ${line}`);
+            return; // Skip this line
+          }
 
-        // Sanitize the concept name to remove trailing commas and whitespace
-        conceptName = sanitizeNodeName(conceptName);
+          const scoreStr = parts[0].trim();
+          let conceptName = parts.slice(1).join(","); // Join back in case concept name had commas
 
-        const score = parseInt(scoreStr, 10);
+          // Sanitize the concept name to remove trailing commas and whitespace
+          conceptName = sanitizeNodeName(conceptName);
 
-        if (isNaN(score) || score < 0 || score > 100) {
-          console.warn(
-            `Skipping line with invalid score (${scoreStr}): ${line}`,
+          const score = parseInt(scoreStr, 10);
+
+          if (isNaN(score) || score < 0 || score > 100) {
+            console.warn(
+              `Skipping line with invalid score (${scoreStr}): ${line}`,
+            );
+            return; // Skip if score is invalid
+          }
+
+          if (!conceptName) {
+            console.warn(`Skipping line with empty concept name: ${line}`);
+            return; // Skip if concept name is empty
+          }
+
+          // Prevent adding duplicate nodes (case-insensitive check)
+          if (
+            nodes.some((n) => n.id.toLowerCase() === conceptName.toLowerCase())
+          ) {
+            console.warn(`Skipping duplicate concept: ${conceptName}`);
+            return;
+          }
+
+          // Create node
+          const newNode: NodeObject = {
+            id: conceptName, // Use sanitized concept name as ID
+            name: conceptName,
+            val: score, // Use score for node size value
+            color: getColorForScore(score), // Set color based on score
+            description: `Related concept to ${sanitizedConcept} (Score: ${score})`,
+          };
+          nodes.push(newNode);
+
+          // Create link from main concept
+          const newLink: LinkObject = {
+            source: mainConceptNode.id,
+            target: newNode.id,
+            value: score / 100, // Normalize score for link value (e.g., thickness/opacity)
+          };
+          links.push(newLink);
+        } catch (parseError) {
+          console.error(
+            `Error parsing line ${index + 1}: "${line}"`,
+            parseError,
           );
-          return; // Skip if score is invalid
+          // Continue processing other lines
         }
-
-        if (!conceptName) {
-          console.warn(`Skipping line with empty concept name: ${line}`);
-          return; // Skip if concept name is empty
-        }
-
-        // Prevent adding duplicate nodes (case-insensitive check)
-        if (
-          nodes.some((n) => n.id.toLowerCase() === conceptName.toLowerCase())
-        ) {
-          console.warn(`Skipping duplicate concept: ${conceptName}`);
-          return;
-        }
-
-        // Create node
-        const newNode: NodeObject = {
-          id: conceptName, // Use sanitized concept name as ID
-          name: conceptName,
-          val: score, // Use score for node size value
-          color: getColorForScore(score), // Set color based on score
-          description: `Related concept to ${sanitizedConcept} (Score: ${score})`,
-        };
-        nodes.push(newNode);
-
-        // Create link from main concept
-        const newLink: LinkObject = {
-          source: mainConceptNode.id,
-          target: newNode.id,
-          value: score / 100, // Normalize score for link value (e.g., thickness/opacity)
-        };
-        links.push(newLink);
-      } catch (parseError) {
-        console.error(`Error parsing line ${index + 1}: "${line}"`, parseError);
-        // Continue processing other lines
-      }
-    });
+      });
+    }
   } catch (error) {
     console.error(
       `Failed to generate or parse knowledge graph from LLM for concept "${sanitizedConcept}":`,

@@ -8,6 +8,16 @@ interface CachedGraph {
   timestamp: number;
 }
 
+// Add new UserNote interface for storing user notes
+export interface UserNote {
+  id: string; // Unique ID (articleId-timestamp)
+  articleId: string; // ID of the article the note is associated with
+  content: string; // The note content
+  timestamp: number; // When the note was created/updated
+  concept: string; // The main concept associated with this note
+  nodeId: string; // The node ID associated with this note
+}
+
 interface CachedArticle {
   id: string;
   nodeId: string;
@@ -41,6 +51,7 @@ export interface GraphLog {
   createdAt: number;
   accessCount: number;
   bookmarkCount: number;
+  noteCount: number; // Add note count to track notes for this concept
 }
 
 // Add a new interface for search history
@@ -54,13 +65,14 @@ export interface SearchHistoryItem {
 let dbPromise: Promise<IDBDatabase> | null = null;
 
 const DB_NAME = "llm-explorer";
-const DB_VERSION = 4;
+const DB_VERSION = 5;
 const GRAPH_STORE = "knowledge-graphs";
 const ARTICLE_STORE = "articles";
 const ARTICLE_CACHE_STORE = "article-cache";
 const BOOKMARK_STORE = "bookmarks";
 const GRAPH_LOG_STORE = "graph-logs";
 const SEARCH_HISTORY_STORE = "search-history";
+const USER_NOTES_STORE = "user-notes";
 
 export function initDB(): Promise<IDBDatabase> {
   if (!dbPromise) {
@@ -151,6 +163,12 @@ export function initDB(): Promise<IDBDatabase> {
         if (!db.objectStoreNames.contains(SEARCH_HISTORY_STORE)) {
           console.log(`Creating ${SEARCH_HISTORY_STORE} object store`);
           db.createObjectStore(SEARCH_HISTORY_STORE, { keyPath: "id" });
+        }
+
+        // Add the user notes store
+        if (!db.objectStoreNames.contains(USER_NOTES_STORE)) {
+          console.log(`Creating ${USER_NOTES_STORE} object store`);
+          db.createObjectStore(USER_NOTES_STORE, { keyPath: "id" });
         }
       };
     });
@@ -467,7 +485,10 @@ export async function removeBookmark(id: string): Promise<void> {
   }
 }
 
-export async function isArticleBookmarked(nodeId: string): Promise<boolean> {
+export async function isArticleBookmarked(
+  nodeId: string,
+  isMainEntry?: boolean,
+): Promise<boolean> {
   try {
     const db = await initDB();
 
@@ -490,6 +511,12 @@ export async function isArticleBookmarked(nodeId: string): Promise<boolean> {
         };
       },
     );
+
+    // If isMainEntry parameter is provided, check if bookmark context matches
+    if (bookmark && isMainEntry !== undefined) {
+      // Only consider it bookmarked if the entry type matches
+      return bookmark.isMainEntry === isMainEntry;
+    }
 
     return !!bookmark;
   } catch (error) {
@@ -675,6 +702,8 @@ export async function logGraphAccess(concept: string): Promise<void> {
         ...existingLog,
         lastAccessed: now,
         accessCount: existingLog.accessCount + 1,
+        // Preserve noteCount in the update
+        noteCount: existingLog.noteCount || 0,
       };
 
       await new Promise<void>((resolve, reject) => {
@@ -695,6 +724,7 @@ export async function logGraphAccess(concept: string): Promise<void> {
         createdAt: now,
         accessCount: 1,
         bookmarkCount: 0,
+        noteCount: 0,
       };
 
       await new Promise<void>((resolve, reject) => {
@@ -764,6 +794,7 @@ export async function updateGraphBookmarkCount(concept: string): Promise<void> {
         createdAt: Date.now(),
         accessCount: 0,
         bookmarkCount: bookmarksForConcept,
+        noteCount: 0,
       };
 
       await new Promise<void>((resolve, reject) => {
@@ -978,5 +1009,196 @@ export async function removeGraphLog(logId: string): Promise<void> {
   } catch (error) {
     console.error("Failed to remove graph log:", error);
     throw error;
+  }
+}
+
+// Function to add/update a user note
+export async function saveUserNote(note: UserNote): Promise<void> {
+  try {
+    const db = await initDB();
+
+    // Check if the store exists
+    if (!db.objectStoreNames.contains(USER_NOTES_STORE)) {
+      console.error(`${USER_NOTES_STORE} store not found`);
+      return;
+    }
+
+    const tx = db.transaction(USER_NOTES_STORE, "readwrite");
+    const store = tx.objectStore(USER_NOTES_STORE);
+
+    // Store the note
+    await store.put(note);
+
+    // Wait for the transaction to complete
+    await new Promise<void>((resolve, reject) => {
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+
+    console.log(`Saved note for article ${note.articleId}`);
+
+    // Update the note count for the concept
+    await updateGraphNoteCount(note.concept);
+  } catch (error) {
+    console.error("Error saving user note:", error);
+    throw error;
+  }
+}
+
+// Function to get all notes for a specific article
+export async function getNotesForArticle(
+  articleId: string,
+): Promise<UserNote[]> {
+  try {
+    const db = await initDB();
+
+    // Check if the store exists
+    if (!db.objectStoreNames.contains(USER_NOTES_STORE)) {
+      console.log("User notes store not found");
+      return [];
+    }
+
+    const tx = db.transaction(USER_NOTES_STORE, "readonly");
+    const store = tx.objectStore(USER_NOTES_STORE);
+
+    // Get all notes
+    const allNotes = await new Promise<UserNote[]>((resolve, reject) => {
+      const request = store.getAll();
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = (event) => {
+        console.error("Error getting notes:", event);
+        reject(event);
+      };
+    });
+
+    // Filter notes for the specific article
+    const articleNotes = allNotes.filter(
+      (note) => note.articleId === articleId,
+    );
+
+    // Sort notes by timestamp (most recent first)
+    return articleNotes.sort((a, b) => b.timestamp - a.timestamp);
+  } catch (error) {
+    console.error("Failed to get notes for article:", error);
+    return [];
+  }
+}
+
+// Function to get all user notes
+export async function getAllUserNotes(): Promise<UserNote[]> {
+  try {
+    const db = await initDB();
+
+    // Check if the store exists
+    if (!db.objectStoreNames.contains(USER_NOTES_STORE)) {
+      console.log("User notes store not found");
+      return [];
+    }
+
+    const tx = db.transaction(USER_NOTES_STORE, "readonly");
+    const store = tx.objectStore(USER_NOTES_STORE);
+
+    // Get all notes
+    const notes = await new Promise<UserNote[]>((resolve, reject) => {
+      const request = store.getAll();
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = (event) => {
+        console.error("Error getting all notes:", event);
+        reject(event);
+      };
+    });
+
+    // Sort notes by timestamp (most recent first)
+    return notes.sort((a, b) => b.timestamp - a.timestamp);
+  } catch (error) {
+    console.error("Failed to get all user notes:", error);
+    return [];
+  }
+}
+
+// Function to delete a user note
+export async function deleteUserNote(
+  noteId: string,
+  concept: string,
+): Promise<void> {
+  try {
+    const db = await initDB();
+
+    // Check if the store exists
+    if (!db.objectStoreNames.contains(USER_NOTES_STORE)) {
+      console.error(`${USER_NOTES_STORE} store not found`);
+      return;
+    }
+
+    const tx = db.transaction(USER_NOTES_STORE, "readwrite");
+    const store = tx.objectStore(USER_NOTES_STORE);
+
+    // Delete the note
+    await store.delete(noteId);
+
+    // Wait for the transaction to complete
+    await new Promise<void>((resolve, reject) => {
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+
+    console.log(`Deleted note with ID ${noteId}`);
+
+    // Update the note count for the concept
+    await updateGraphNoteCount(concept);
+  } catch (error) {
+    console.error("Error deleting user note:", error);
+    throw error;
+  }
+}
+
+// Function to update graph note count
+export async function updateGraphNoteCount(concept: string): Promise<void> {
+  try {
+    const db = await initDB();
+
+    // Ensure the store exists
+    if (!db.objectStoreNames.contains(GRAPH_LOG_STORE)) {
+      console.log("Graph log store not found, skipping update");
+      return;
+    }
+
+    // Get all notes for this concept
+    const allNotes = await getAllUserNotes();
+    const notesForConcept = allNotes.filter(
+      (note) => note.concept === concept,
+    ).length;
+
+    const tx = db.transaction(GRAPH_LOG_STORE, "readwrite");
+    const store = tx.objectStore(GRAPH_LOG_STORE);
+
+    const graphId = `graph-log-${concept.toLowerCase().replace(/\s+/g, "-")}`;
+
+    // Try to get existing log
+    const existingLog = await new Promise<GraphLog | undefined>((resolve) => {
+      const request = store.get(graphId);
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => resolve(undefined);
+    });
+
+    if (existingLog) {
+      // Update existing log
+      const updatedLog = {
+        ...existingLog,
+        noteCount: notesForConcept,
+      };
+
+      await new Promise<void>((resolve, reject) => {
+        const request = store.put(updatedLog);
+        request.onsuccess = () => resolve();
+        request.onerror = (event) => reject(event);
+      });
+
+      console.log(
+        `Updated graph log for "${concept}": ${updatedLog.noteCount} notes`,
+      );
+    }
+  } catch (error) {
+    console.error("Error updating graph note count:", error);
   }
 }

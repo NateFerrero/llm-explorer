@@ -1,6 +1,6 @@
 "use client";
 
-import { generateNodeContent } from "@/lib/api-clients";
+import { generateNodeContent, sanitizeNodeName } from "@/lib/api-clients";
 import { generateKnowledgeGraph } from "@/lib/graphGenerator";
 import {
   addToSearchHistory as addToSearchHistoryDB,
@@ -53,6 +53,7 @@ import HelpCenter from "./HelpCenter";
 import KeyboardShortcuts from "./KeyboardShortcuts";
 import ModelSwitcher from "./ModelSwitcher";
 import NodeDetail from "./NodeDetail";
+import SearchFilter from "./SearchFilter";
 
 // Default sidebar width
 const DEFAULT_SIDEBAR_WIDTH = 320; // 20rem = 320px
@@ -160,6 +161,14 @@ const KnowledgeExplorer: React.FC = () => {
     null,
   );
 
+  // State for search filters
+  const [bookmarkFilter, setBookmarkFilter] = useState<string>("");
+  const [logFilter, setLogFilter] = useState<string>("");
+  const [filteredBookmarks, setFilteredBookmarks] = useState<
+    BookmarkedArticle[]
+  >([]);
+  const [filteredGraphLogs, setFilteredGraphLogs] = useState<GraphLog[]>([]);
+
   // Mouse event handlers for resizing
   const handleMouseDown = (e: React.MouseEvent) => {
     e.preventDefault();
@@ -201,9 +210,9 @@ const KnowledgeExplorer: React.FC = () => {
       console.log("Sidebar resize complete, reheating graph");
       setTimeout(() => {
         if (ForceGraph.current) {
-          // Update the graph dimensions
-          ForceGraph.current.width(containerRef.current?.clientWidth || 800);
-          ForceGraph.current.height(containerRef.current?.clientHeight || 600);
+          // Instead of calling width() and height() as functions,
+          // we need to update the component directly on next render
+          refreshGraph();
 
           // Reheat the simulation
           const simulation = ForceGraph.current.d3Force();
@@ -317,7 +326,7 @@ const KnowledgeExplorer: React.FC = () => {
   }, [activeBookmarkMenu, activeGraphLogMenu]);
 
   const handleExploreNode = async (node: NodeObject) => {
-    const nodeName = node.name || node.id;
+    const nodeName = sanitizeNodeName(node.name || node.id);
     console.log(`Exploring node ${nodeName} as main concept`);
 
     // Set the search query to the node name or ID
@@ -468,6 +477,21 @@ const KnowledgeExplorer: React.FC = () => {
         linkForce.distance(150);
       }
 
+      // Fix the main concept node to the center
+      if (graphData.nodes.length > 0) {
+        // Find the main concept node (first node)
+        const mainNode = graphData.nodes[0];
+        if (mainNode) {
+          // Get container dimensions
+          const width = containerRef.current?.clientWidth || 800;
+          const height = containerRef.current?.clientHeight || 600;
+
+          // Pin the main node to the center
+          mainNode.fx = width / 2;
+          mainNode.fy = height / 2;
+        }
+      }
+
       // Reheat the simulation with moderate energy
       const simulation = ForceGraph.current.d3Force();
       if (simulation && typeof simulation.alpha === "function") {
@@ -485,6 +509,13 @@ const KnowledgeExplorer: React.FC = () => {
       const height = containerRef.current?.clientHeight || 600;
 
       console.log(`Expanding graph to fill space: ${width}x${height}`);
+
+      // Pin the main concept node to center
+      const mainNode = graphData.nodes[0];
+      if (mainNode) {
+        mainNode.fx = width / 2;
+        mainNode.fy = height / 2;
+      }
 
       // Apply a consistent, moderate force
       const chargeForce = ForceGraph.current.d3Force("charge");
@@ -634,7 +665,8 @@ const KnowledgeExplorer: React.FC = () => {
     // Clean the content first
     const cleanedContent = cleanContent(content);
 
-    console.log("Setting content for node:", nodeObj.name || nodeObj.id);
+    const sanitizedNodeName = sanitizeNodeName(nodeObj.name || nodeObj.id);
+    console.log("Setting content for node:", sanitizedNodeName);
     console.log("Content length:", cleanedContent.length);
     console.log("Content preview:", cleanedContent.substring(0, 100));
     console.log("Context:", nodeObj.mainConcept || "None");
@@ -685,7 +717,10 @@ const KnowledgeExplorer: React.FC = () => {
     } catch (err) {
       console.error("Error fetching expanded node summary:", err);
       // Keep the detail level state but show error message
-      const errorMsg = `Failed to expand content for ${selectedNode.name || selectedNode.id} to level ${newDetailLevel}. ${err instanceof Error ? err.message : "Unknown error"}`;
+      const sanitizedNodeName = sanitizeNodeName(
+        selectedNode.name || selectedNode.id,
+      );
+      const errorMsg = `Failed to expand content for ${sanitizedNodeName} to level ${newDetailLevel}. ${err instanceof Error ? err.message : "Unknown error"}`;
       updateNodeWithContent(selectedNode, errorMsg);
     }
   };
@@ -695,7 +730,7 @@ const KnowledgeExplorer: React.FC = () => {
     node: NodeObject,
     mainConcept: string,
   ): string => {
-    const nodeName = node.name || node.id;
+    const nodeName = sanitizeNodeName(node.name || node.id);
     const description =
       node.description || `A concept related to ${mainConcept}`;
     return `# ${nodeName}
@@ -1358,14 +1393,22 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
 
   // Create a function to update tab and URL
   const handleTabChange = (tab: "explore" | "bookmarks" | "log") => {
-    // Avoid unnecessary state updates and URL changes if tab hasn't changed
-    if (activeTab === tab) {
-      console.log(`Tab ${tab} already active, skipping change`);
-      return;
-    }
+    if (tab === activeTab) return;
 
-    console.log(`Changing tab from ${activeTab} to ${tab}`);
     setActiveTab(tab);
+
+    // Clear any active filters when changing tabs
+    if (tab === "bookmarks") {
+      setLogFilter("");
+      loadBookmarks();
+    } else if (tab === "log") {
+      setBookmarkFilter("");
+      loadGraphLogs();
+    } else {
+      // Clear both filters if going to explore
+      setBookmarkFilter("");
+      setLogFilter("");
+    }
 
     // Update URL params silently to avoid triggering additional effects
     updateUrlParams({ explorerTab: tab });
@@ -1376,13 +1419,6 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
       setSummaryText("");
       setSummaryLoading(false);
     }
-
-    // Load appropriate data based on the tab
-    if (tab === "bookmarks") {
-      loadBookmarks();
-    } else if (tab === "log") {
-      loadGraphLogs();
-    }
   };
 
   // Add an effect to handle browser navigation (back/forward buttons)
@@ -1391,41 +1427,16 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
       // Update tab state based on URL when navigating with browser history
       const urlParams = new URLSearchParams(window.location.search);
       const tabParam = urlParams.get("explorerTab");
-
-      if (
-        tabParam === "explore" ||
-        tabParam === "bookmarks" ||
-        tabParam === "log"
-      ) {
-        setActiveTab(tabParam);
-
-        // Clear selected node when switching to bookmarks or log tabs
-        if (tabParam === "bookmarks" || tabParam === "log") {
-          setSelectedNode(null);
-          setSummaryText("");
-          setSummaryLoading(false);
-        }
-      }
-    };
-
-    window.addEventListener("popstate", handlePopState);
-    return () => window.removeEventListener("popstate", handlePopState);
-  }, []);
-
-  // Effect to handle loading from URL parameters
-  useEffect(() => {
-    // Define loading from URL parameters
-    const loadFromUrlParams = async () => {
-      // Only run in browser environment
-      if (typeof window === "undefined") return;
-
-      // Get URL search parameters
-      const urlParams = new URLSearchParams(window.location.search);
       const queryParam = urlParams.get("q");
       const nodeParam = urlParams.get("node");
-      const tabParam = urlParams.get("explorerTab");
 
-      // Set correct tab first
+      console.log("Browser navigation detected:", {
+        tabParam,
+        queryParam,
+        nodeParam,
+      });
+
+      // Handle tab changes
       if (
         tabParam === "explore" ||
         tabParam === "bookmarks" ||
@@ -1434,326 +1445,49 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
         if (tabParam !== activeTab) {
           setActiveTab(tabParam as "explore" | "bookmarks" | "log");
 
-          const currentTab = tabParam as "explore" | "bookmarks" | "log";
-          if (currentTab === "bookmarks" || currentTab === "log") {
-            setSelectedNode(null);
-            setSummaryText("");
-            setSummaryLoading(false);
-
-            // Load appropriate data for the tab
-            if (currentTab === "bookmarks") {
-              loadBookmarks();
-            } else if (currentTab === "log") {
-              loadGraphLogs();
-            }
-
-            // If not on explore tab, don't load the graph
-            return;
+          // Load data for the specific tab
+          if (tabParam === "bookmarks") {
+            loadBookmarks();
+          } else if (tabParam === "log") {
+            loadGraphLogs();
           }
         }
       }
 
-      // If we don't have a query parameter, don't try to load a graph
-      if (!queryParam) {
-        return;
-      }
-
-      // Avoid infinite loop by checking if we're already handling this exact URL state
-      const currentNodeId = selectedNode?.id;
-      const isAlreadyLoadedGraph =
-        graphData.nodes.length > 0 && graphData.nodes[0].id === queryParam;
-      const isAlreadySelectedNode = nodeParam && currentNodeId === nodeParam;
-
-      if (isAlreadyLoadedGraph && isAlreadySelectedNode) {
-        console.log("URL params match current state, skipping reload");
-        return;
-      }
-
-      console.log(
-        `Loading from URL params: query=${queryParam}${nodeParam ? `, node=${nodeParam}` : ""}`,
-      );
-
-      // Set the search query state
-      setSearchQuery(queryParam);
-      // Also update the input value when loading from URL
-      setInputValue(queryParam);
-      // Set pending search query for visual feedback during loading
-      setPendingSearchQuery(queryParam);
-
-      // Only show loading indicator if we don't have graph data already
-      if (graphData.nodes.length === 0) {
-        setIsLoading(true);
-      }
-
-      try {
-        // Check if we already have this graph loaded
-        if (isAlreadyLoadedGraph) {
-          console.log(
-            `Graph for ${queryParam} is already loaded, skipping reload`,
-          );
-
-          // If we have a node parameter, select that node
-          if (nodeParam && nodeParam !== currentNodeId) {
-            const node = graphData.nodes.find((n) => n.id === nodeParam);
-            if (node) {
-              // Instead of calling handleNodeClick, manually set selected node
-              setSelectedNode(node);
-              setSummaryLoading(true);
-              setDetailLevel(1);
-
-              // Highlight the selected node and its connections
-              const newHighlightNodes = new Set<string>();
-              newHighlightNodes.add(node.id);
-
-              // Add connected nodes to highlights if present
-              if (node.connections) {
-                node.connections.forEach((connId) => {
-                  newHighlightNodes.add(connId);
-                });
-              }
-
-              setHighlightNodes(newHighlightNodes);
-
-              // Get content for node
-              try {
-                console.log(
-                  "Generating content using model:",
-                  selectedModel.name,
-                  `(${selectedModel.id})`,
-                );
-                console.log("Node:", node.name || node.id);
-
-                const content = await generateNodeContent(
-                  node,
-                  queryParam,
-                  selectedModel.id,
-                  1, // Default detail level
-                );
-
-                // Update node with content
-                updateNodeWithContent(node, content);
-              } catch (error) {
-                console.error("Error generating node content:", error);
-                updateNodeWithContent(
-                  node,
-                  generateFallbackContent(node, queryParam),
-                );
-              }
-            }
-          }
-        } else {
-          // Try to get the cached graph for this concept
-          let graphToUse = await getCachedKnowledgeGraph(queryParam);
-
-          if (graphToUse) {
-            console.log(`Loaded cached graph for ${queryParam}`);
-            setGraphData(graphToUse);
-
-            // Only do a single reheat with a short timeout
-            setTimeout(() => {
-              reheatForceSimulation();
-            }, 300);
-          } else {
-            // If no cached graph, generate a new one
-            console.log(
-              `No cached graph for ${queryParam}, generating new one`,
-            );
-            graphToUse = await generateKnowledgeGraph(
-              queryParam,
-              selectedModel.id,
-            );
-            setGraphData(graphToUse);
-
-            // Cache the newly generated graph
-            await cacheKnowledgeGraph(queryParam, graphToUse);
-          }
-
-          // If we have a node parameter, select that node after a short delay
-          if (nodeParam) {
-            setTimeout(() => {
-              const node = graphToUse.nodes.find((n) => n.id === nodeParam);
-              if (node) {
-                // Instead of calling handleNodeClick, manually set selected node
-                setSelectedNode(node);
-                setSummaryLoading(true);
-                setDetailLevel(1);
-
-                // Highlight the selected node and its connections
-                const newHighlightNodes = new Set<string>();
-                newHighlightNodes.add(node.id);
-                setHighlightNodes(newHighlightNodes);
-
-                // In a timeout to ensure we don't try to get content before the graph is ready
-                setTimeout(async () => {
-                  try {
-                    console.log(
-                      "Generating content using model:",
-                      selectedModel.name,
-                      `(${selectedModel.id})`,
-                    );
-                    console.log("Node:", node.name || node.id);
-
-                    const content = await generateNodeContent(
-                      node,
-                      queryParam,
-                      selectedModel.id,
-                      1, // Default detail level
-                    );
-
-                    // Update node with content
-                    updateNodeWithContent(node, content);
-                  } catch (error) {
-                    console.error("Error generating node content:", error);
-                    updateNodeWithContent(
-                      node,
-                      generateFallbackContent(node, queryParam),
-                    );
-                  }
-                }, 500);
-              }
-            }, 500);
-          }
-        }
-      } catch (error) {
-        console.error("Error loading from URL parameters:", error);
-        setError(`Failed to load content from URL: ${error}`);
-      } finally {
-        setIsLoading(false);
-        // Clear the pending search query
-        setPendingSearchQuery("");
-      }
-    };
-
-    loadFromUrlParams();
-
-    // This effect should run once on mount and then only when the URL changes
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // Add a separate effect to handle URL changes
-  useEffect(() => {
-    const handleUrlChange = () => {
-      // Reset the processed states when URL changes
-      processedUrlStatesRef.current.clear();
-
-      // Now re-run the loadFromUrlParams
-      const loadFromUrlParams = async () => {
-        // Only run in browser environment
-        if (typeof window === "undefined") return;
-
-        // Get URL search parameters
-        const urlParams = new URLSearchParams(window.location.search);
-        const queryParam = urlParams.get("q");
-        const nodeParam = urlParams.get("node");
-        const tabParam = urlParams.get("explorerTab");
-
-        // Create a unique key for this URL state
-        const urlStateKey = `${queryParam || ""}-${nodeParam || ""}-${tabParam || ""}`;
-
-        // Skip if we've already processed this exact URL state
-        if (processedUrlStatesRef.current.has(urlStateKey)) {
-          return;
-        }
-
-        // Mark this URL state as processed
-        processedUrlStatesRef.current.add(urlStateKey);
-
-        // Set correct tab first
-        if (
-          tabParam === "explore" ||
-          tabParam === "bookmarks" ||
-          tabParam === "log"
-        ) {
-          if (tabParam !== activeTab) {
-            setActiveTab(tabParam as "explore" | "bookmarks" | "log");
-
-            const currentTab = tabParam as "explore" | "bookmarks" | "log";
-            if (currentTab === "bookmarks" || currentTab === "log") {
-              setSelectedNode(null);
-              setSummaryText("");
-              setSummaryLoading(false);
-
-              if (currentTab === "bookmarks") {
-                loadBookmarks();
-              } else if (currentTab === "log") {
-                loadGraphLogs();
-              }
-
-              return;
-            }
-          }
-        }
-
-        // If we don't have a query parameter, don't try to load a graph
-        if (!queryParam) {
-          return;
-        }
-
-        // Check if we're changing to a new root concept
-        const isNewConcept = searchQuery !== queryParam;
-
-        // Set the search query
-        if (isNewConcept) {
+      // Handle query/search changes
+      if (tabParam === "explore" && queryParam) {
+        if (queryParam !== searchQuery) {
           setSearchQuery(queryParam);
-          // Also update the input value for consistency when navigating
           setInputValue(queryParam);
-          // Set pending search query for visual feedback during navigation
-          setPendingSearchQuery(queryParam);
+          setVisualInputValue(queryParam);
 
-          // Clear selected node when changing to a new concept if there's no node param
-          if (!nodeParam) {
-            setSelectedNode(null);
-            setSummaryText("");
-            setSummaryLoading(false);
+          // If we have a new query, reload the graph
+          if (
+            graphData.nodes.length === 0 ||
+            graphData.nodes[0]?.id !== queryParam
+          ) {
+            setPendingSearchQuery(queryParam);
+            handleSearch(queryParam, true);
           }
         }
 
-        // Only handle changing nodes when staying on the same graph
-        if (
-          graphData.nodes.length > 0 &&
-          graphData.nodes[0].id === queryParam &&
-          nodeParam
-        ) {
-          const currentNodeId = selectedNode?.id;
-
-          // Only change the node if needed
-          if (nodeParam !== currentNodeId) {
-            const node = graphData.nodes.find((n) => n.id === nodeParam);
-            if (node) {
-              handleNodeClick(node);
-            }
+        // Handle node selection
+        if (nodeParam) {
+          const node = graphData.nodes.find((n) => n.id === nodeParam);
+          if (node && (!selectedNode || selectedNode.id !== nodeParam)) {
+            handleNodeClick(node);
           }
-          // Clear pending search query when we're done
-          setPendingSearchQuery("");
-        } else if (isNewConcept && graphData.nodes.length === 0) {
-          // If changing to a new concept and we don't have graph data, trigger a search
-          try {
-            await handleSearch(queryParam, false, false);
-          } finally {
-            // Make sure pending search query is cleared even if there's an error
-            setPendingSearchQuery("");
-          }
-        } else {
-          // Clear pending search query for any other cases
-          setPendingSearchQuery("");
+        } else if (selectedNode) {
+          // Clear selected node if no node param and we have a selection
+          setSelectedNode(null);
+          setSummaryText("");
         }
-      };
-
-      loadFromUrlParams();
+      }
     };
 
-    // Listen for popstate events (back/forward navigation)
-    window.addEventListener("popstate", handleUrlChange);
-
-    // Initial URL handling
-    handleUrlChange();
-
-    return () => {
-      window.removeEventListener("popstate", handleUrlChange);
-    };
-    // Only depends on necessary values and functions
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTab, searchQuery, graphData.nodes, handleNodeClick]);
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, [activeTab, searchQuery, graphData.nodes, handleNodeClick, selectedNode]);
 
   // Modify the reheat effect when graph data changes
   useEffect(() => {
@@ -1800,9 +1534,8 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
         console.log("Container size changed, updating graph");
 
         if (ForceGraph.current) {
-          // Update width and height
-          ForceGraph.current.width(containerRef.current?.clientWidth || 800);
-          ForceGraph.current.height(containerRef.current?.clientHeight || 600);
+          // Instead of calling methods, let the component refresh on next render
+          refreshGraph();
 
           // After a small delay, reheat the simulation
           setTimeout(() => {
@@ -1826,6 +1559,15 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
     }
   }, [graphData.nodes.length]);
 
+  // Add a helper function to force a re-render of the graph
+  const refreshGraph = useCallback(() => {
+    // Force a re-render of the component which will update the width and height props
+    setForceUpdate((prev) => !prev);
+  }, []);
+
+  // Add state to trigger re-render
+  const [forceUpdate, setForceUpdate] = useState(false);
+
   // Handle sign out function
   const handleSignOut = () => {
     // Clear selected model state
@@ -1844,6 +1586,105 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
     // Set the URL back to the root without parameters
     window.location.href = window.location.pathname;
   };
+
+  // Filter bookmarks when bookmark data or filter changes
+  useEffect(() => {
+    if (!bookmarkFilter.trim()) {
+      setFilteredBookmarks(bookmarkedArticles);
+    } else {
+      const lowerFilter = bookmarkFilter.toLowerCase();
+      const filtered = bookmarkedArticles.filter(
+        (bookmark) =>
+          bookmark.title.toLowerCase().includes(lowerFilter) ||
+          (bookmark.description &&
+            bookmark.description.toLowerCase().includes(lowerFilter)) ||
+          (bookmark.mainConcept &&
+            bookmark.mainConcept.toLowerCase().includes(lowerFilter)),
+      );
+      setFilteredBookmarks(filtered);
+    }
+  }, [bookmarkedArticles, bookmarkFilter]);
+
+  // Filter graph logs when log data or filter changes
+  useEffect(() => {
+    if (!logFilter.trim()) {
+      setFilteredGraphLogs(graphLogs);
+    } else {
+      const lowerFilter = logFilter.toLowerCase();
+      const filtered = graphLogs.filter((log) =>
+        log.concept.toLowerCase().includes(lowerFilter),
+      );
+      setFilteredGraphLogs(filtered);
+    }
+  }, [graphLogs, logFilter]);
+
+  // Handle initial graph sizing and window resize events
+  useEffect(() => {
+    // Function to update ForceGraph dimensions
+    const updateGraphDimensions = () => {
+      if (ForceGraph.current && containerRef.current) {
+        refreshGraph();
+      }
+    };
+
+    // Set initial dimensions
+    updateGraphDimensions();
+
+    // Add window resize listener
+    window.addEventListener("resize", updateGraphDimensions);
+
+    // Cleanup
+    return () => {
+      window.removeEventListener("resize", updateGraphDimensions);
+    };
+  }, [refreshGraph]);
+
+  // Effect to modify graph when data changes - pin the main node in the center
+  useEffect(() => {
+    if (
+      containerRef.current &&
+      graphData.nodes.length > 0 &&
+      ForceGraph.current
+    ) {
+      // Pin the main node to the center
+      const mainNode = graphData.nodes[0];
+      const width = containerRef.current.clientWidth;
+      const height = containerRef.current.clientHeight;
+
+      if (mainNode) {
+        mainNode.fx = width / 2;
+        mainNode.fy = height / 2;
+
+        // Ensure all nodes have proper coordinates before reheat
+        graphData.nodes.forEach((node) => {
+          if (
+            node !== mainNode &&
+            (node.x === undefined || node.y === undefined)
+          ) {
+            // Random position for nodes that don't have coordinates yet
+            node.x = width / 2 + (Math.random() - 0.5) * 100;
+            node.y = height / 2 + (Math.random() - 0.5) * 100;
+          }
+        });
+      }
+
+      // Apply modifications to force simulation
+      const simulation = ForceGraph.current.d3Force();
+      if (simulation) {
+        // Configure forces for better layout
+        const chargeForce = ForceGraph.current.d3Force("charge");
+        if (chargeForce) {
+          chargeForce.strength(-120); // Stronger repulsion
+        }
+
+        // Restart simulation with higher energy
+        simulation.alpha(0.5).restart();
+      }
+
+      // Refresh the graph to apply changes
+      refreshGraph();
+    }
+  }, [graphData, refreshGraph]);
 
   return (
     <div className="flex h-full flex-col">
@@ -1903,18 +1744,23 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
                   // First, immediately update the visual input for instant feedback
                   setVisualInputValue(inputValue);
 
-                  // Then close the dropdown - the visual state will ensure the value doesn't flash
-                  setShowSearchHistory(false);
-
                   // Set the pending search query for styling
                   setPendingSearchQuery(inputValue);
 
                   // Update searchQuery from input when submitting
                   setSearchQuery(inputValue);
+
+                  // Execute the search first
                   await handleSearch(inputValue);
+
+                  // Only close dropdown after search completes successfully
+                  setShowSearchHistory(false);
                 } catch (err) {
                   console.error("Error executing search:", err);
                   setPendingSearchQuery(""); // Clear pending state on error
+
+                  // Don't close dropdown on error so user can try again
+                  setError(`Failed to search: ${err}`);
                 }
               }
             }}
@@ -1929,22 +1775,30 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
                     key={item.id}
                     className="flex cursor-pointer items-center justify-between px-4 py-2 hover:bg-slate-700"
                     onClick={async () => {
-                      // Set both input value and search query
-                      setInputValue(item.query);
-                      // Immediately update visual input value
-                      setVisualInputValue(item.query);
-                      // Close dropdown first - visual state prevents flashing
-                      setShowSearchHistory(false);
-                      // Set pending state
-                      setPendingSearchQuery(item.query);
-
-                      setSearchQuery(item.query);
-                      // Execute the search
                       try {
+                        // Start with visual feedback - show the query in the input
+                        setInputValue(item.query);
+                        setVisualInputValue(item.query);
+
+                        // Set pending search query to indicate loading state
+                        setPendingSearchQuery(item.query);
+
+                        // Update the search query
+                        setSearchQuery(item.query);
+
+                        // Execute the search (don't close dropdown until search completes)
                         await handleSearch(item.query);
+
+                        // Only close the dropdown after search completes successfully
+                        setShowSearchHistory(false);
                       } catch (err) {
                         console.error("Error executing search:", err);
-                        setPendingSearchQuery("");
+                        setPendingSearchQuery(""); // Clear pending state on error
+
+                        // Don't close dropdown on error so user can try again
+                        setError(
+                          `Failed to search for "${item.query}": ${err}`,
+                        );
                       }
                     }}
                   >
@@ -1972,17 +1826,24 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
               try {
                 // Immediately update visual input for instant feedback
                 setVisualInputValue(inputValue);
-                // Close dropdown first - visual state prevents flashing
-                setShowSearchHistory(false);
+
                 // Set the pending search query for styling
                 setPendingSearchQuery(inputValue);
 
                 // Update searchQuery from input when clicking button
                 setSearchQuery(inputValue);
+
+                // Execute the search first
                 await handleSearch(inputValue);
+
+                // Only close dropdown after search completes successfully
+                setShowSearchHistory(false);
               } catch (err) {
                 console.error("Error executing search:", err);
                 setPendingSearchQuery(""); // Clear pending state on error
+
+                // Don't close dropdown on error so user can try again
+                setError(`Failed to search: ${err}`);
               }
             }}
             disabled={isLoading || !inputValue.trim() || !!pendingSearchQuery}
@@ -2267,14 +2128,17 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
             <ForceGraph2D
               ref={ForceGraph}
               graphData={graphData}
-              nodeLabel={(node) => node.name || node.id || ""}
+              nodeLabel={(node) => sanitizeNodeName(node.name || node.id || "")}
               nodeRelSize={8}
               linkWidth={1.5}
               linkDirectionalParticles={2}
               linkDirectionalParticleWidth={2}
               linkDirectionalParticleSpeed={0.005}
+              // Use clientWidth and clientHeight directly to ensure proper sizing
+              width={containerRef.current?.clientWidth}
+              height={containerRef.current?.clientHeight}
               nodeCanvasObject={(node, ctx, globalScale) => {
-                const label = node.name || node.id || "";
+                const label = sanitizeNodeName(node.name || node.id || "");
                 const fontSize = 12 / globalScale;
                 const nodeSize = node.val
                   ? Math.sqrt(Math.max(0, node.val || 1)) * 0.4
@@ -2307,6 +2171,21 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
                   // Make highlight more visible
                   ctx.strokeStyle = "rgba(255, 107, 107, 0.8)";
                   ctx.lineWidth = 2 / globalScale;
+                  ctx.stroke();
+                }
+
+                // Add a special visual indicator for the main concept node
+                if (node === graphData.nodes[0]) {
+                  ctx.beginPath();
+                  ctx.arc(
+                    node.x || 0,
+                    node.y || 0,
+                    nodeSize + 0.3,
+                    0,
+                    2 * Math.PI,
+                  );
+                  ctx.strokeStyle = "rgba(255, 255, 255, 0.6)";
+                  ctx.lineWidth = 1.5 / globalScale;
                   ctx.stroke();
                 }
 
@@ -2357,8 +2236,8 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
                 }
               }}
               cooldownTicks={100}
-              d3VelocityDecay={0.3}
-              d3AlphaDecay={0.01}
+              d3VelocityDecay={0.4} // Increased for more stability
+              d3AlphaDecay={0.015} // Slightly increased for faster stabilization
               onEngineStop={() => {
                 // When the initial cooldown is complete, apply a reheat to ensure nodes are well-distributed
                 console.log(
@@ -2386,8 +2265,6 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
                   }
                 }, 100);
               }}
-              width={containerRef.current?.clientWidth || 800}
-              height={containerRef.current?.clientHeight || 600}
             />
           )}
         </div>
@@ -2478,7 +2355,7 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
 
           {activeTab === "bookmarks" && (
             // Bookmarks tab content
-            <div className="h-full overflow-auto">
+            <div className="flex h-full flex-col">
               {bookmarksLoading ? (
                 <div className="flex h-40 items-center justify-center">
                   <div className="h-5 w-5 animate-spin rounded-full border-2 border-white border-t-transparent"></div>
@@ -2495,99 +2372,123 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
                   </p>
                 </div>
               ) : (
-                <div className="divide-y divide-slate-700">
-                  {bookmarkedArticles.map((bookmark) => (
-                    <div
-                      key={bookmark.id}
-                      className="block w-full border-b border-slate-700 last:border-b-0"
-                    >
-                      <button
-                        className="block w-full cursor-pointer px-4 py-3 text-left hover:bg-slate-700"
-                        onClick={() => handleBookmarkClick(bookmark)}
-                      >
-                        <div className="flex items-start">
-                          <Bookmark
-                            size={18}
-                            className="mr-2 mt-1 flex-shrink-0 fill-yellow-400 text-yellow-400"
-                          />
-                          <div className="flex-1">
-                            <h3 className="font-medium text-white">
-                              {bookmark.title}
-                            </h3>
-                            {bookmark.description && (
-                              <p className="mt-1 text-sm text-slate-300">
-                                {bookmark.description}
-                              </p>
-                            )}
-                            <p className="mt-1 text-xs text-slate-400">
-                              From: {bookmark.mainConcept} •{" "}
-                              {new Date(bookmark.timestamp).toLocaleString()}
-                            </p>
-                            <div className="mt-2 flex items-center">
-                              <a
-                                href={generateBookmarkLink(bookmark)}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                className="mr-3 flex items-center text-xs text-blue-400 hover:underline"
-                                onClick={(e) => e.stopPropagation()} // Prevent bookmark click when clicking the link
-                              >
-                                <Link size={12} className="mr-1" />
-                                Open in new tab
-                              </a>
-                              <button
-                                onClick={(e) => {
-                                  e.stopPropagation(); // Prevent bookmark click
-                                  copyBookmarkLink(bookmark);
-                                }}
-                                className="flex items-center text-xs text-slate-400 hover:text-slate-200"
-                              >
-                                <Share2 size={12} className="mr-1" />
-                                Copy link
-                              </button>
-                            </div>
-                          </div>
-                          <div className="relative ml-2">
+                <>
+                  <SearchFilter
+                    placeholder="Search bookmarks..."
+                    onFilterChange={setBookmarkFilter}
+                    totalResults={bookmarkedArticles.length}
+                    filteredResults={filteredBookmarks.length}
+                  />
+                  <div className="flex-1 overflow-auto">
+                    {filteredBookmarks.length === 0 ? (
+                      <div className="flex h-64 flex-col items-center justify-center p-8 text-center">
+                        <Search size={36} className="mb-4 text-slate-400" />
+                        <h3 className="text-lg font-medium text-slate-300">
+                          No bookmarks found
+                        </h3>
+                        <p className="mt-2 text-slate-400">
+                          Try a different search term
+                        </p>
+                      </div>
+                    ) : (
+                      <div className="divide-y divide-slate-700">
+                        {filteredBookmarks.map((bookmark) => (
+                          <div
+                            key={bookmark.id}
+                            className="block w-full border-b border-slate-700 last:border-b-0"
+                          >
                             <button
-                              onClick={(e) => {
-                                e.stopPropagation(); // Prevent bookmark click
-                                setActiveBookmarkMenu(
-                                  activeBookmarkMenu === bookmark.id
-                                    ? null
-                                    : bookmark.id,
-                                );
-                              }}
-                              className="flex h-8 w-8 items-center justify-center rounded-full text-slate-400 hover:bg-slate-600 hover:text-white"
-                              aria-label="Bookmark options"
+                              className="block w-full cursor-pointer px-4 py-3 text-left hover:bg-slate-700"
+                              onClick={() => handleBookmarkClick(bookmark)}
                             >
-                              <MoreVertical size={16} />
-                            </button>
+                              <div className="flex items-start">
+                                <Bookmark
+                                  size={18}
+                                  className="mr-2 mt-1 flex-shrink-0 fill-yellow-400 text-yellow-400"
+                                />
+                                <div className="flex-1">
+                                  <h3 className="font-medium text-white">
+                                    {bookmark.title}
+                                  </h3>
+                                  {bookmark.description && (
+                                    <p className="mt-1 text-sm text-slate-300">
+                                      {bookmark.description}
+                                    </p>
+                                  )}
+                                  <p className="mt-1 text-xs text-slate-400">
+                                    From: {bookmark.mainConcept} •{" "}
+                                    {new Date(
+                                      bookmark.timestamp,
+                                    ).toLocaleString()}
+                                  </p>
+                                  <div className="mt-2 flex items-center">
+                                    <a
+                                      href={generateBookmarkLink(bookmark)}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      className="mr-3 flex items-center text-xs text-blue-400 hover:underline"
+                                      onClick={(e) => e.stopPropagation()} // Prevent bookmark click when clicking the link
+                                    >
+                                      <Link size={12} className="mr-1" />
+                                      Open in new tab
+                                    </a>
+                                    <button
+                                      onClick={(e) => {
+                                        e.stopPropagation(); // Prevent bookmark click
+                                        copyBookmarkLink(bookmark);
+                                      }}
+                                      className="flex items-center text-xs text-slate-400 hover:text-slate-200"
+                                    >
+                                      <Share2 size={12} className="mr-1" />
+                                      Copy link
+                                    </button>
+                                  </div>
+                                </div>
+                                <div className="relative ml-2">
+                                  <button
+                                    onClick={(e) => {
+                                      e.stopPropagation(); // Prevent bookmark click
+                                      setActiveBookmarkMenu(
+                                        activeBookmarkMenu === bookmark.id
+                                          ? null
+                                          : bookmark.id,
+                                      );
+                                    }}
+                                    className="flex h-8 w-8 items-center justify-center rounded-full text-slate-400 hover:bg-slate-600 hover:text-white"
+                                    aria-label="Bookmark options"
+                                  >
+                                    <MoreVertical size={16} />
+                                  </button>
 
-                            {activeBookmarkMenu === bookmark.id && (
-                              <div className="absolute right-0 top-8 z-10 min-w-[150px] rounded-md border border-slate-700 bg-slate-800 py-1 shadow-lg">
-                                <button
-                                  onClick={(e) =>
-                                    handleRemoveBookmark(bookmark, e)
-                                  }
-                                  className="flex w-full items-center px-4 py-2 text-left text-sm text-red-400 hover:bg-slate-700"
-                                >
-                                  <Trash2 size={14} className="mr-2" />
-                                  Remove bookmark
-                                </button>
+                                  {activeBookmarkMenu === bookmark.id && (
+                                    <div className="absolute right-0 top-8 z-10 min-w-[150px] rounded-md border border-slate-700 bg-slate-800 py-1 shadow-lg">
+                                      <button
+                                        onClick={(e) =>
+                                          handleRemoveBookmark(bookmark, e)
+                                        }
+                                        className="flex w-full items-center px-4 py-2 text-left text-sm text-red-400 hover:bg-slate-700"
+                                      >
+                                        <Trash2 size={14} className="mr-2" />
+                                        Remove bookmark
+                                      </button>
+                                    </div>
+                                  )}
+                                </div>
                               </div>
-                            )}
+                            </button>
                           </div>
-                        </div>
-                      </button>
-                    </div>
-                  ))}
-                </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </>
               )}
             </div>
           )}
 
           {activeTab === "log" && (
             // Log tab content
-            <div className="h-full overflow-auto">
+            <div className="flex h-full flex-col">
               {graphLogsLoading ? (
                 <div className="flex h-40 items-center justify-center">
                   <div className="h-5 w-5 animate-spin rounded-full border-2 border-white border-t-transparent"></div>
@@ -2604,82 +2505,113 @@ Recent advancements in ${nodeName} have opened new possibilities for innovation 
                   </p>
                 </div>
               ) : (
-                <div className="divide-y divide-slate-700">
-                  {graphLogs.map((log) => (
-                    <div
-                      key={log.id}
-                      className="block w-full border-b border-slate-700 last:border-b-0"
-                    >
-                      <div className="block w-full cursor-pointer px-4 py-3 text-left hover:bg-slate-700">
-                        <div className="flex items-start">
-                          <History
-                            size={18}
-                            className="mr-2 mt-1 flex-shrink-0 text-blue-400"
-                          />
-                          <div className="flex-1">
-                            <h3 className="font-medium text-white">
-                              {log.concept}
-                            </h3>
-                            <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1 text-xs">
-                              <span className="text-blue-300">
-                                Accessed: {log.accessCount} times
-                              </span>
-                              <span className="text-yellow-300">
-                                Bookmarks: {log.bookmarkCount}
-                              </span>
-                              <span className="text-slate-400">
-                                Last accessed:{" "}
-                                {new Date(log.lastAccessed).toLocaleString()}
-                              </span>
-                              <span className="text-slate-400">
-                                Created:{" "}
-                                {new Date(log.createdAt).toLocaleString()}
-                              </span>
-                            </div>
-                            <div className="mt-3">
-                              <button
-                                onClick={() => {
-                                  setSearchQuery(log.concept);
-                                  handleSearch(log.concept, false);
-                                  setActiveTab("explore");
-                                }}
-                                className="rounded-full bg-blue-600 px-3 py-1 text-xs text-white hover:bg-blue-700"
-                              >
-                                Load Graph
-                              </button>
-                            </div>
-                          </div>
-                          <div className="relative ml-2">
-                            <button
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                setActiveGraphLogMenu(
-                                  activeGraphLogMenu === log.id ? null : log.id,
-                                );
-                              }}
-                              className="flex h-8 w-8 items-center justify-center rounded-full text-slate-400 hover:bg-slate-600 hover:text-white"
-                              aria-label="Graph log options"
-                            >
-                              <MoreVertical size={16} />
-                            </button>
-
-                            {activeGraphLogMenu === log.id && (
-                              <div className="absolute right-0 top-8 z-10 min-w-[150px] rounded-md border border-slate-700 bg-slate-800 py-1 shadow-lg">
-                                <button
-                                  onClick={(e) => handleRemoveGraphLog(log, e)}
-                                  className="flex w-full items-center px-4 py-2 text-left text-sm text-red-400 hover:bg-slate-700"
-                                >
-                                  <Trash2 size={14} className="mr-2" />
-                                  Remove graph
-                                </button>
-                              </div>
-                            )}
-                          </div>
-                        </div>
+                <>
+                  <SearchFilter
+                    placeholder="Search logs..."
+                    onFilterChange={setLogFilter}
+                    totalResults={graphLogs.length}
+                    filteredResults={filteredGraphLogs.length}
+                  />
+                  <div className="flex-1 overflow-auto">
+                    {filteredGraphLogs.length === 0 ? (
+                      <div className="flex h-64 flex-col items-center justify-center p-8 text-center">
+                        <Search size={36} className="mb-4 text-slate-400" />
+                        <h3 className="text-lg font-medium text-slate-300">
+                          No logs found
+                        </h3>
+                        <p className="mt-2 text-slate-400">
+                          Try a different search term
+                        </p>
                       </div>
-                    </div>
-                  ))}
-                </div>
+                    ) : (
+                      <div className="divide-y divide-slate-700">
+                        {filteredGraphLogs.map((log) => (
+                          <div
+                            key={log.id}
+                            className="block w-full border-b border-slate-700 last:border-b-0"
+                          >
+                            <div className="block w-full cursor-pointer px-4 py-3 text-left hover:bg-slate-700">
+                              <div className="flex items-start">
+                                <History
+                                  size={18}
+                                  className="mr-2 mt-1 flex-shrink-0 text-blue-400"
+                                />
+                                <div className="flex-1">
+                                  <h3 className="font-medium text-white">
+                                    {log.concept}
+                                  </h3>
+                                  <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1 text-xs">
+                                    <span className="text-blue-300">
+                                      Accessed: {log.accessCount} times
+                                    </span>
+                                    <span className="text-yellow-300">
+                                      Bookmarks: {log.bookmarkCount}
+                                    </span>
+                                    <span className="text-green-300">
+                                      Notes: {log.noteCount}
+                                    </span>
+                                    <span className="text-slate-400">
+                                      Last accessed:{" "}
+                                      {new Date(
+                                        log.lastAccessed,
+                                      ).toLocaleString()}
+                                    </span>
+                                    <span className="text-slate-400">
+                                      Created:{" "}
+                                      {new Date(log.createdAt).toLocaleString()}
+                                    </span>
+                                  </div>
+                                  <div className="mt-3">
+                                    <button
+                                      onClick={() => {
+                                        setSearchQuery(log.concept);
+                                        handleSearch(log.concept, false);
+                                        setActiveTab("explore");
+                                      }}
+                                      className="rounded-full bg-blue-600 px-3 py-1 text-xs text-white hover:bg-blue-700"
+                                    >
+                                      Load Graph
+                                    </button>
+                                  </div>
+                                </div>
+                                <div className="relative ml-2">
+                                  <button
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setActiveGraphLogMenu(
+                                        activeGraphLogMenu === log.id
+                                          ? null
+                                          : log.id,
+                                      );
+                                    }}
+                                    className="flex h-8 w-8 items-center justify-center rounded-full text-slate-400 hover:bg-slate-600 hover:text-white"
+                                    aria-label="Graph log options"
+                                  >
+                                    <MoreVertical size={16} />
+                                  </button>
+
+                                  {activeGraphLogMenu === log.id && (
+                                    <div className="absolute right-0 top-8 z-10 min-w-[150px] rounded-md border border-slate-700 bg-slate-800 py-1 shadow-lg">
+                                      <button
+                                        onClick={(e) =>
+                                          handleRemoveGraphLog(log, e)
+                                        }
+                                        className="flex w-full items-center px-4 py-2 text-left text-sm text-red-400 hover:bg-slate-700"
+                                      >
+                                        <Trash2 size={14} className="mr-2" />
+                                        Remove graph
+                                      </button>
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </>
               )}
             </div>
           )}

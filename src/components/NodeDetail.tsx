@@ -1,5 +1,6 @@
 "use client";
 
+import { sanitizeNodeName } from "@/lib/api-clients";
 import {
   bookmarkArticle,
   isArticleBookmarked,
@@ -10,6 +11,7 @@ import { ExternalLink } from "lucide-react";
 import { marked } from "marked";
 import React, { useCallback, useEffect, useState } from "react";
 import MarkdownContent from "./MarkdownContent";
+import UserNoteSection from "./UserNoteSection";
 
 interface NodeDetailProps {
   node: NodeObject;
@@ -81,14 +83,19 @@ const NodeDetail: React.FC<NodeDetailProps> = ({
 
   useEffect(() => {
     if (summary) {
-      const parsed = marked.parse(summary);
-      setHtml(parsed);
+      try {
+        const parsed = marked.parse(summary);
+        setHtml(parsed as string);
 
-      // Extract links from markdown
-      const regex = /\[([^\]]+)\]\(node:([^)]+)\)/g;
-      const matches = [...summary.matchAll(regex)];
-      const linkedNodes = matches.map((match) => match[2]);
-      setRelatedNodes(linkedNodes);
+        // Extract links from markdown
+        const regex = /\[([^\]]+)\]\(node:([^)]+)\)/g;
+        const matches = [...summary.matchAll(regex)];
+        const linkedNodes = matches.map((match) => match[2]);
+        setRelatedNodes(linkedNodes);
+      } catch (error) {
+        console.error("Error parsing markdown:", error);
+        setHtml(summary); // Fallback to raw text
+      }
     }
   }, [summary]);
 
@@ -98,7 +105,7 @@ const NodeDetail: React.FC<NodeDetailProps> = ({
 
     const checkBookmarkStatus = async () => {
       try {
-        const isMarked = await isArticleBookmarked(node.id);
+        const isMarked = await isArticleBookmarked(node.id, isMainEntry);
         setIsBookmarked(isMarked);
       } catch (error) {
         console.error("Error checking bookmark status:", error);
@@ -106,7 +113,7 @@ const NodeDetail: React.FC<NodeDetailProps> = ({
     };
 
     checkBookmarkStatus();
-  }, [node?.id]);
+  }, [node?.id, isMainEntry]);
 
   const toggleExpanded = () => {
     setIsExpanded(!isExpanded);
@@ -130,7 +137,7 @@ const NodeDetail: React.FC<NodeDetailProps> = ({
       } else {
         // Create formatted content with proper title for bookmark
         const contentToSave = node.content || summary;
-        const nodeTitle = node.name || node.id;
+        const nodeTitle = sanitizeNodeName(node.name || node.id);
 
         // Determine the correct mainConcept based on whether this is a main entry
         // If it's a main entry, use the node's own id as the mainConcept
@@ -153,6 +160,7 @@ const NodeDetail: React.FC<NodeDetailProps> = ({
           mainConcept: bookmarkMainConcept,
           timestamp: Date.now(),
           description: bookmarkDescription,
+          isMainEntry: isMainEntry,
         });
         setIsBookmarked(true);
         if (onBookmarkToggle) {
@@ -212,8 +220,8 @@ const NodeDetail: React.FC<NodeDetailProps> = ({
     // Get the base URL
     const baseUrl = window.location.origin + window.location.pathname;
 
-    // Add query parameters for the node name
-    const nodeName = encodeURIComponent(node.name || node.id);
+    // Add query parameters for the node name - sanitize before encoding
+    const nodeName = encodeURIComponent(sanitizeNodeName(node.name || node.id));
     return `${baseUrl}?q=${nodeName}&explorerTab=explore`;
   };
 
@@ -233,7 +241,7 @@ const NodeDetail: React.FC<NodeDetailProps> = ({
     <div className="flex h-full flex-col overflow-hidden">
       <div className="mb-2 flex items-center justify-between border-b border-slate-700 bg-slate-800 px-4 py-3">
         <h2 className="text-lg font-medium text-white">
-          {node.name || node.id}
+          {sanitizeNodeName(node.name || node.id)}
         </h2>
         <button
           onClick={handleToggleBookmark}
@@ -271,8 +279,8 @@ const NodeDetail: React.FC<NodeDetailProps> = ({
         <div className="mb-2 rounded-md bg-blue-900/20 px-4 py-2 text-sm">
           <div className="flex items-center justify-between">
             <span>
-              Viewing <strong>{node.name || node.id}</strong> in the context of{" "}
-              <strong>{mainConcept}</strong>
+              Viewing <strong>{sanitizeNodeName(node.name || node.id)}</strong>{" "}
+              in the context of <strong>{sanitizeNodeName(mainConcept)}</strong>
             </span>
             <button
               onClick={() => onExploreNode(node)}
@@ -289,7 +297,7 @@ const NodeDetail: React.FC<NodeDetailProps> = ({
         <div className="flex flex-1 flex-col items-center justify-center p-6">
           <div className="h-8 w-8 animate-spin rounded-full border-2 border-blue-500 border-t-transparent"></div>
           <p className="mt-4 text-slate-400">
-            Generating content for {node.name || node.id}...
+            Generating content for {sanitizeNodeName(node.name || node.id)}...
           </p>
         </div>
       ) : (
@@ -311,6 +319,13 @@ const NodeDetail: React.FC<NodeDetailProps> = ({
               </button>
             </div>
           )}
+
+          {/* Add the user notes section */}
+          <UserNoteSection
+            articleId={node.id}
+            nodeId={node.id}
+            concept={mainConcept}
+          />
 
           {relatedNodes.length > 0 && (
             <div className="mb-4 mt-8">

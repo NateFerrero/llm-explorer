@@ -1,16 +1,24 @@
 import { AIServiceError } from "./api/util";
 import { cacheArticle, getCachedArticle } from "./indexeddb";
+import {
+  generateConceptKnowledgeGraphPrompt,
+  generateListKnowledgeGraphPrompt,
+} from "./prompts";
 import { NodeObject } from "./types";
 
 // We no longer need direct API clients as we'll use the util.ts proxy
 
 // Function to sanitize node names by trimming whitespace and removing trailing commas
 export function sanitizeNodeName(name: string): string {
-  // First trim whitespace, then remove any trailing commas
-  return name.trim().replace(/,+$/, "");
+  if (!name) return "";
+  // First trim whitespace, then remove any trailing commas, then trim again in case there was whitespace after commas
+  return name
+    .trim()
+    .replace(/,+\s*$/, "")
+    .trim();
 }
 
-// Function to generate a prompt for knowledge graph extraction using LLM
+// Legacy function kept for backward compatibility
 export function generateKnowledgeGraphPrompt(concept: string): string {
   // Sanitize the concept name
   const sanitizedConcept = sanitizeNodeName(concept);
@@ -34,6 +42,36 @@ export function generateKnowledgeGraphPrompt(concept: string): string {
     Do NOT include headers, explanations, or any text other than the list of "score,concept_name" lines.
     Ensure each line has exactly one comma separating the score and the concept name.
   `;
+}
+
+// Function to generate combined knowledge graph prompts
+// This calls both list and concept functions and returns both prompts as an array
+export async function generateCombinedKnowledgeGraph(
+  concept: string,
+  modelId: string,
+): Promise<string[]> {
+  // Sanitize the concept name
+  const sanitizedConcept = sanitizeNodeName(concept);
+
+  // Generate both prompts
+  const listPrompt = generateListKnowledgeGraphPrompt(sanitizedConcept);
+  const conceptPrompt = generateConceptKnowledgeGraphPrompt(sanitizedConcept);
+
+  // Query both prompts and return results
+  const listResponse = await queryLLM(listPrompt, modelId);
+  const conceptResponse = await queryLLM(conceptPrompt, modelId);
+
+  let results: string[] = [];
+
+  if (listResponse.success && listResponse.data) {
+    results.push(listResponse.data);
+  }
+
+  if (conceptResponse.success && conceptResponse.data) {
+    results.push(conceptResponse.data);
+  }
+
+  return results;
 }
 
 // Function to generate a prompt for node content with varying detail
