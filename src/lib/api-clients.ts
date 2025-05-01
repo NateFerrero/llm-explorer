@@ -58,16 +58,20 @@ export async function generateCombinedKnowledgeGraph(
   const conceptPrompt = generateConceptKnowledgeGraphPrompt(sanitizedConcept);
 
   // Query both prompts and return results
-  const listResponse = await queryLLM(listPrompt, modelId);
-  const conceptResponse = await queryLLM(conceptPrompt, modelId);
+  const [listResponse, conceptResponse] = await Promise.all([
+    queryLLM(listPrompt, modelId),
+    queryLLM(conceptPrompt, modelId),
+  ]);
 
   let results: string[] = [];
 
   if (listResponse.success && listResponse.data) {
+    console.log("List response:", listResponse.data);
     results.push(listResponse.data);
   }
 
   if (conceptResponse.success && conceptResponse.data) {
+    console.log("Concept response:", conceptResponse.data);
     results.push(conceptResponse.data);
   }
 
